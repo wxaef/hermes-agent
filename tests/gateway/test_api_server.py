@@ -3012,6 +3012,126 @@ class TestSplitRuntimeChatCompletions:
         assert ctg.has_pending(f"chat:{session_id}") is False
 
     @pytest.mark.asyncio
+    async def test_resume_without_session_header_uses_derived_session(self, monkeypatch):
+        """TRAE-style clients do not echo back the private X-Hermes-Session-Id
+        header on tool-result follow-ups.  A resume request whose last
+        user/assistant message has no visible payload must still find the
+        parked turn via the derived conversation-fingerprint session id,
+        instead of failing with 400 'No user message found in messages'."""
+        from agent.agent_runtime_helpers import relay_client_tool
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        derived = _derive_chat_session_id(None, "search for hermes")
+        seen = {}
+        mock_agent = MagicMock()
+
+        def fake_run_conversation(user_message, conversation_history, task_id):
+            raw = relay_client_tool(
+                mock_agent, "search_files", {"query": "hermes"}, "call_0002"
+            )
+            seen["tool_result"] = raw
+            return {"final_response": "found it", "session_id": derived}
+
+        mock_agent.run_conversation.side_effect = fake_run_conversation
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+        mock_agent._client_tool_session_key = f"chat:{derived}"
+
+        auth_only = {"Authorization": "Bearer sk-secret"}
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            async with TestClient(TestServer(app)) as cli:
+                # Phase 1: no session header; the derived id parks the turn.
+                resp1 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=auth_only,
+                    json={
+                        "model": "test-model",
+                        "tools": [{
+                            "type": "function",
+                            "function": {"name": "search_files", "description": "Search"},
+                        }],
+                        "messages": [{"role": "user", "content": "search for hermes"}],
+                    },
+                )
+                assert resp1.status == 200, await resp1.text()
+                body1 = await resp1.json()
+                assert body1["choices"][0]["finish_reason"] == "tool_calls"
+                assert resp1.headers.get("X-Hermes-Session-Id") == derived
+
+                # Phase 2: tool result follow-up WITHOUT X-Hermes-Session-Id
+                # (TRAE never sends it) -- must resume the parked turn.
+                resp2 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=auth_only,
+                    json={
+                        "model": "test-model",
+                        "messages": [
+                            {"role": "user", "content": "search for hermes"},
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": "call_0002",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "search_files",
+                                        "arguments": '{"query": "hermes"}',
+                                    },
+                                }],
+                            },
+                            {"role": "tool", "tool_call_id": "call_0002", "content": '{"matches": ["a.py"]}'},
+                        ],
+                    },
+                )
+                assert resp2.status == 200, await resp2.text()
+                body2 = await resp2.json()
+                assert body2["choices"][0]["message"]["content"] == "found it"
+                assert body2["choices"][0]["finish_reason"] == "stop"
+                assert seen["tool_result"] == '{"matches": ["a.py"]}'
+        assert ctg.has_pending(f"chat:{derived}") is False
+
+    @pytest.mark.asyncio
+    async def test_tool_result_without_live_turn_still_rejected(self, monkeypatch):
+        """A stray role=tool request with no parked turn and no session
+        header must not slip through as a bogus empty-message turn -- it
+        stays a 400 (no derived-session state exists to resume)."""
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        auth_only = {"Authorization": "Bearer sk-secret"}
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                headers=auth_only,
+                json={
+                    "model": "test-model",
+                    "messages": [
+                        {"role": "user", "content": "search for hermes"},
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": "call_stray",
+                                "type": "function",
+                                "function": {"name": "search_files", "arguments": "{}"},
+                            }],
+                        },
+                        {"role": "tool", "tool_call_id": "call_stray", "content": "{}"},
+                    ],
+                },
+            )
+            assert resp.status == 400
+            assert "No user message found" in (await resp.json())["error"]["message"]
+
+    @pytest.mark.asyncio
     async def test_multi_round_client_tools_keep_same_agent(self, monkeypatch):
         """One user request may cycle through several client tools
         (search_files -> read_file -> final answer), always resuming the SAME

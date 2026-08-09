@@ -4274,11 +4274,25 @@ class APIServerAdapter(BasePlatformAdapter):
             # call; it re-validates the session there (a missing/expired
             # state yields 409 no_active_turn, not this 400).
             _session_header = request.headers.get("X-Hermes-Session-Id", "").strip()
-            _is_split_resume = (
-                self._split_runtime_enabled()
-                and any(m.get("role") == "tool" for m in messages)
-                and bool(_session_header)
-            )
+            _has_tool_result = any(m.get("role") == "tool" for m in messages)
+            _is_split_resume = self._split_runtime_enabled() and _has_tool_result
+            if _is_split_resume and not _session_header:
+                # Standard OpenAI clients (TRAE, Open WebUI, ...) do not
+                # reliably echo back the private X-Hermes-Session-Id header
+                # on tool-result follow-ups.  Fall back to the conversation
+                # fingerprint derivation the session block below performs
+                # and accept the request only when a split turn is actually
+                # parked under the derived id -- a stray role=tool message
+                # with no live turn still gets rejected here (or a proper
+                # 409 downstream if the turn just finished), instead of
+                # creating a bogus empty-message turn.
+                _first_user = ""
+                for _cm in conversation_messages:
+                    if _cm.get("role") == "user":
+                        _first_user = _cm.get("content", "")
+                        break
+                _derived_sid = _derive_chat_session_id(system_prompt, _first_user)
+                _is_split_resume = f"chat:{_derived_sid}" in self._chat_split_runs
             if not _is_split_resume:
                 return web.json_response(
                     {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
