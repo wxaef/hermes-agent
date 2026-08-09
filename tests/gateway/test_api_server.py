@@ -2866,3 +2866,470 @@ class TestCreateAgentModelRecovery:
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
 
+
+# ---------------------------------------------------------------------------
+# Split-runtime chat completions (client-executed tools)
+# ---------------------------------------------------------------------------
+
+
+class TestSplitRuntimeChatCompletions:
+    """Split-runtime round trip over /v1/chat/completions without a live model.
+
+    A mock agent whose ``run_conversation`` parks on ``relay_client_tool``
+    (exactly what the invoke_tool interception does) while the HTTP layer
+    returns standard OpenAI ``tool_calls``; the next request then delivers
+    the ``role=tool`` result and the agent resumes to the final answer.
+    """
+
+    @staticmethod
+    def _make_split_adapter(api_key="sk-secret"):
+        adapter = _make_adapter(api_key=api_key)
+        adapter._split_runtime = True
+        return adapter
+
+    @staticmethod
+    def _split_headers(session_id):
+        return {
+            "Authorization": "Bearer sk-secret",
+            "X-Hermes-Session-Id": session_id,
+        }
+
+    @pytest.mark.asyncio
+    async def test_client_tool_relay_roundtrip(self, monkeypatch):
+        from agent.agent_runtime_helpers import relay_client_tool
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        # Safety net: if the notify bridge breaks, the relay times out in 3s
+        # instead of hanging the suite for the 300s default.
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        session_id = "split-session-1"
+        seen = {}
+        mock_agent = MagicMock()
+
+        def fake_run_conversation(user_message, conversation_history, task_id):
+            # The model asked for a client tool: the interception relays it
+            # and SUSPENDS until the client answers (role=tool request).
+            raw = relay_client_tool(
+                mock_agent, "search_files", {"query": "hermes"}, "call_0001"
+            )
+            seen["tool_result"] = raw
+            return {"final_response": "found it", "session_id": session_id}
+
+        mock_agent.run_conversation.side_effect = fake_run_conversation
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+        # _create_agent normally injects this (from client_tool_session_key);
+        # the mock must carry it so relay_client_tool registers under the
+        # same relay key the notify hook is registered under.
+        mock_agent._client_tool_session_key = f"chat:{session_id}"
+
+        headers = self._split_headers(session_id)
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            async with TestClient(TestServer(app)) as cli:
+                # Phase 1: agent suspends on search_files -> tool_calls.
+                resp1 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "tools": [{
+                            "type": "function",
+                            "function": {"name": "search_files", "description": "Search"},
+                        }],
+                        "messages": [{"role": "user", "content": "search for hermes"}],
+                    },
+                )
+                assert resp1.status == 200, await resp1.text()
+                body1 = await resp1.json()
+                assert body1["id"].startswith("chatcmpl-")
+                choice1 = body1["choices"][0]
+                assert choice1["finish_reason"] == "tool_calls"
+                tool_calls = choice1["message"]["tool_calls"]
+                assert len(tool_calls) == 1
+                fn = tool_calls[0]["function"]
+                assert fn["name"] == "search_files"
+                assert json.loads(fn["arguments"]) == {"query": "hermes"}
+                assert tool_calls[0]["id"] == "call_0001"
+                assert resp1.headers.get("X-Hermes-Session-Id") == session_id
+
+                # A plain user turn while the agent is parked -> 409.
+                parked = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={"model": "test-model", "messages": [{"role": "user", "content": "hello?"}]},
+                )
+                assert parked.status == 409
+                assert (await parked.json())["error"]["code"] == "agent_waiting_for_tool"
+
+                # Phase 2: deliver the tool result -> agent resumes.
+                resp2 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "messages": [
+                            {"role": "user", "content": "search for hermes"},
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": "call_0001",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "search_files",
+                                        "arguments": '{"query": "hermes"}',
+                                    },
+                                }],
+                            },
+                            {"role": "tool", "tool_call_id": "call_0001", "content": '{"matches": ["a.py"]}'},
+                        ],
+                    },
+                )
+                assert resp2.status == 200, await resp2.text()
+                body2 = await resp2.json()
+                assert body2["choices"][0]["message"]["content"] == "found it"
+                assert body2["choices"][0]["finish_reason"] == "stop"
+                assert seen["tool_result"] == '{"matches": ["a.py"]}'
+
+                # A late tool result after the turn ended -> 409 no_active_turn.
+                late = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "messages": [
+                            {"role": "user", "content": "search for hermes"},
+                            {"role": "tool", "tool_call_id": "call_late", "content": "{}"},
+                        ],
+                    },
+                )
+                assert late.status == 409
+                assert (await late.json())["error"]["code"] == "no_active_turn"
+        assert ctg.has_pending(f"chat:{session_id}") is False
+
+    @pytest.mark.asyncio
+    async def test_multi_round_client_tools_keep_same_agent(self, monkeypatch):
+        """One user request may cycle through several client tools
+        (search_files -> read_file -> final answer), always resuming the SAME
+        parked agent -- the state table keeps the original agent_task alive
+        across every tool_calls round trip (#24 in the spec)."""
+        from agent.agent_runtime_helpers import relay_client_tool
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        session_id = "split-multi-session-1"
+        seen = {}
+        mock_agent = MagicMock()
+
+        def fake_run_conversation(user_message, conversation_history, task_id):
+            # Two client tool calls in one turn: the relay suspends twice,
+            # each parked on its own call id, both on this single agent call.
+            seen["tool_1"] = relay_client_tool(
+                mock_agent, "search_files", {"query": "hermes"}, "call_a1"
+            )
+            seen["tool_2"] = relay_client_tool(
+                mock_agent, "read_file", {"path": "a.py"}, "call_a2"
+            )
+            return {"final_response": "here is the file", "session_id": session_id}
+
+        mock_agent.run_conversation.side_effect = fake_run_conversation
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+        mock_agent._client_tool_session_key = f"chat:{session_id}"
+
+        headers = self._split_headers(session_id)
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            async with TestClient(TestServer(app)) as cli:
+                # Phase 1: first tool suspension -> search_files tool_calls.
+                resp1 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "tools": [
+                            {"type": "function", "function": {"name": "search_files", "description": "S"}},
+                            {"type": "function", "function": {"name": "read_file", "description": "R"}},
+                        ],
+                        "messages": [{"role": "user", "content": "find and read a.py"}],
+                    },
+                )
+                assert resp1.status == 200, await resp1.text()
+                calls1 = (await resp1.json())["choices"][0]["message"]["tool_calls"]
+                assert calls1[0]["id"] == "call_a1"
+                assert calls1[0]["function"]["name"] == "search_files"
+
+                # Phase 2: deliver search result -> agent suspends again on
+                # read_file; still the same parked agent, no new turn.
+                resp2 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "messages": [
+                            {"role": "user", "content": "find and read a.py"},
+                            {"role": "assistant", "content": "", "tool_calls": [{
+                                "id": "call_a1", "type": "function",
+                                "function": {"name": "search_files", "arguments": "{}"},
+                            }]},
+                            {"role": "tool", "tool_call_id": "call_a1", "content": '{"matches": ["a.py"]}'},
+                        ],
+                    },
+                )
+                assert resp2.status == 200, await resp2.text()
+                calls2 = (await resp2.json())["choices"][0]["message"]["tool_calls"]
+                assert calls2[0]["id"] == "call_a2"
+                assert calls2[0]["function"]["name"] == "read_file"
+                assert seen.get("tool_1") == '{"matches": ["a.py"]}'
+
+                # Phase 3: deliver read result -> the same agent finishes.
+                resp3 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "messages": [
+                            {"role": "user", "content": "find and read a.py"},
+                            {"role": "assistant", "content": "", "tool_calls": [{
+                                "id": "call_a2", "type": "function",
+                                "function": {"name": "read_file", "arguments": "{}"},
+                            }]},
+                            {"role": "tool", "tool_call_id": "call_a2", "content": "# hello"},
+                        ],
+                    },
+                )
+                assert resp3.status == 200, await resp3.text()
+                body3 = await resp3.json()
+                assert body3["choices"][0]["message"]["content"] == "here is the file"
+                assert body3["choices"][0]["finish_reason"] == "stop"
+                assert seen.get("tool_2") == "# hello"
+                # The same single run_conversation served all three phases.
+                assert mock_agent.run_conversation.call_count == 1
+        assert ctg.has_pending(f"chat:{session_id}") is False
+
+    @pytest.mark.asyncio
+    async def test_client_tool_relay_roundtrip_streaming(self, monkeypatch):
+        """Same round trip with stream=true: phase 1 ends with a tool_calls
+        chunk + [DONE] (agent stays parked), phase 2 delivers the result
+        and ends with a stop chunk + [DONE]."""
+        from agent.agent_runtime_helpers import relay_client_tool
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        session_id = "split-stream-session-1"
+        seen = {}
+        mock_agent = MagicMock()
+
+        def fake_run_conversation(user_message, conversation_history, task_id):
+            raw = relay_client_tool(
+                mock_agent, "patch", {"path": "a.py", "diff": "x"}, "call_9001"
+            )
+            seen["tool_result"] = raw
+            return {"final_response": "patched ok", "session_id": session_id}
+
+        mock_agent.run_conversation.side_effect = fake_run_conversation
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+        mock_agent._client_tool_session_key = f"chat:{session_id}"
+
+        def _parse_sse(body):
+            events = []
+            for line in body.splitlines():
+                if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                    try:
+                        events.append(json.loads(line[len("data: "):]))
+                    except json.JSONDecodeError:
+                        continue
+            return events
+
+        headers = self._split_headers(session_id)
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            async with TestClient(TestServer(app)) as cli:
+                # Phase 1: stream suspends on patch -> tool_calls chunk + [DONE].
+                resp1 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "stream": True,
+                        "tools": [{
+                            "type": "function",
+                            "function": {"name": "patch", "description": "P"},
+                        }],
+                        "messages": [{"role": "user", "content": "patch a.py"}],
+                    },
+                )
+                assert resp1.status == 200, await resp1.text()
+                body1 = await resp1.text()
+                chunks1 = _parse_sse(body1)
+                assert chunks1[0]["choices"][0]["delta"].get("role") == "assistant"
+                # Standard OpenAI streaming shape: the tool_calls delta chunk,
+                # then an empty delta closing with finish_reason="tool_calls".
+                tc_choice = chunks1[-2]["choices"][0]
+                tc = tc_choice["delta"]["tool_calls"][0]
+                assert tc_choice["finish_reason"] is None
+                assert tc["id"] == "call_9001"
+                assert tc["function"]["name"] == "patch"
+                assert json.loads(tc["function"]["arguments"]) == {"path": "a.py", "diff": "x"}
+                assert chunks1[-1]["choices"][0]["finish_reason"] == "tool_calls"
+                assert chunks1[-1]["choices"][0]["delta"] == {}
+                assert body1.endswith("data: [DONE]\n\n")
+                assert resp1.headers.get("X-Hermes-Session-Id") == session_id
+
+                # Phase 2: deliver the result -> agent resumes, stream ends normally.
+                resp2 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "stream": True,
+                        "messages": [
+                            {"role": "user", "content": "patch a.py"},
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": "call_9001",
+                                    "type": "function",
+                                    "function": {"name": "patch", "arguments": "{}"},
+                                }],
+                            },
+                            {"role": "tool", "tool_call_id": "call_9001", "content": '{"ok": true}'},
+                        ],
+                    },
+                )
+                assert resp2.status == 200, await resp2.text()
+                body2 = await resp2.text()
+                chunks2 = _parse_sse(body2)
+                assert chunks2[0]["choices"][0]["delta"].get("role") == "assistant"
+                finish_choice = chunks2[-1]["choices"][0]
+                assert finish_choice["finish_reason"] == "stop"
+                assert finish_choice.get("delta", {}) == {}
+                assert body2.endswith("data: [DONE]\n\n")
+                assert seen["tool_result"] == '{"ok": true}'
+        assert ctg.has_pending(f"chat:{session_id}") is False
+
+    @pytest.mark.asyncio
+    async def test_tool_result_for_wrong_call_id_returns_409(self, monkeypatch):
+        from agent.agent_runtime_helpers import relay_client_tool
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        session_id = "split-session-2"
+        seen = {}
+        mock_agent = MagicMock()
+
+        def fake_run_conversation(user_message, conversation_history, task_id):
+            raw = relay_client_tool(
+                mock_agent, "read_file", {"path": "a.py"}, "call_0002"
+            )
+            seen["tool_result"] = raw
+            return {"final_response": "done", "session_id": session_id}
+
+        mock_agent.run_conversation.side_effect = fake_run_conversation
+        mock_agent._client_tool_session_key = f"chat:{session_id}"
+        headers = self._split_headers(session_id)
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            async with TestClient(TestServer(app)) as cli:
+                resp1 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "tools": [{
+                            "type": "function",
+                            "function": {"name": "read_file", "description": "Read"},
+                        }],
+                        "messages": [{"role": "user", "content": "read a.py"}],
+                    },
+                )
+                assert resp1.status == 200, await resp1.text()
+                assert (await resp1.json())["choices"][0]["finish_reason"] == "tool_calls"
+
+                # Wrong call_id (not the pending one) -> 409 tool_call_not_pending.
+                wrong = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "messages": [
+                            {"role": "user", "content": "read a.py"},
+                            {"role": "tool", "tool_call_id": "call_9999", "content": "{}"},
+                        ],
+                    },
+                )
+                assert wrong.status == 409
+                assert (await wrong.json())["error"]["code"] == "tool_call_not_pending"
+                # The agent thread is still parked; clean it up so the test exits.
+                ctg.clear_session(f"chat:{session_id}")
+        assert ctg.has_pending(f"chat:{session_id}") is False
+
+    def test_parse_split_client_tools_filters(self):
+        """Only shadowable names participate; duplicates and non-shadowable
+        names (web_search, mcp_*, ...) are skipped, not rejected."""
+        adapter = _make_adapter()
+        body = {
+            "tools": [
+                {"type": "function", "function": {"name": "search_files", "description": "s"}},
+                {"type": "function", "function": {"name": "web_search", "description": "w"}},
+                {"type": "function", "function": {"name": "search_files", "description": "dup"}},
+                {"type": "function", "function": {"name": "mcp_filesystem_read", "description": "m"}},
+                {"not": "a tool"},
+                "garbage",
+            ]
+        }
+        tools = adapter._parse_split_client_tools(body)
+        assert [t["function"]["name"] for t in tools] == ["search_files"]
+        assert tools[0]["function"]["description"] == "s"
+
+    def test_parse_split_client_tools_empty(self):
+        adapter = _make_adapter()
+        assert adapter._parse_split_client_tools({}) == []
+        assert adapter._parse_split_client_tools({"tools": []}) == []
+
+    @pytest.mark.asyncio
+    async def test_split_runtime_off_does_not_hijack_client_tools(self):
+        """With split_runtime disabled, a shadowable name in ``tools`` must
+        flow through the normal server-side path untouched."""
+        adapter = _make_adapter()
+        app = _create_app(adapter)
+        called = {}
+
+        async def _mock_run_agent(**kwargs):
+            called["extra_client_tools"] = kwargs.get("extra_client_tools")
+            return (
+                {"final_response": "server did it"},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test-model",
+                        "tools": [{
+                            "type": "function",
+                            "function": {"name": "search_files", "description": "s"},
+                        }],
+                        "messages": [{"role": "user", "content": "search"}],
+                    },
+                )
+                assert resp.status == 200, await resp.text()
+                assert (await resp.json())["choices"][0]["message"]["content"] == "server did it"
+        assert called["extra_client_tools"] is None
+

@@ -47,6 +47,7 @@ import itertools
 import json
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from functools import wraps
 import logging
 import os
@@ -152,10 +153,53 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+CHAT_COMPLETIONS_SPLIT_STATE_TTL = 600  # seconds; lazy sweep for abandoned split-runtime turns
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
+
+# Split-runtime: tool names a client may shadow with its own local
+# implementation.  When /v1/chat/completions carries one of these in its
+# ``tools`` array (and ``api_server.split_runtime`` is enabled), the
+# server-side tool of the same name is removed from the agent's toolset and
+# calls are relayed back to the client as standard OpenAI ``tool_calls``
+# (the client executes locally and returns the result in the next request
+# as a ``role=tool`` message).  Every other name in a client ``tools``
+# array is ignored -- Hermes keeps executing its own server-side tool.
+CLIENT_SHADOWABLE_TOOLS = frozenset({
+    "search_files",
+    "read_file",
+    "write_file",
+    "patch",
+    "terminal",
+    "execute_code",
+})
+
+
+@dataclass
+class ChatSplitState:
+    """One in-flight split-runtime chat turn.
+
+    The agent thread runs in an executor and SUSPENDS inside
+    ``tools.client_tool_gateway.wait_for_result`` whenever the model calls a
+    client-supplied tool.  The HTTP handler returns a standard OpenAI
+    ``tool_calls`` response (with ``finish_reason: "tool_calls"``) while the
+    agent task stays alive; the client's next request (``role=tool``)
+    resolves the pending call and the agent resumes from where it parked.
+    """
+    session_id: str
+    relay_key: str
+    agent_task: asyncio.Task
+    agent_ref: list
+    stream_q: "ThreadSafeAsyncQueue"
+    client_tool_names: set
+    pending_call_id: Optional[str] = None
+    finished: bool = False
+    result: Any = None
+    usage: Any = None
+    error: Optional[str] = None
+
 
 
 class ThreadSafeAsyncQueue(asyncio.Queue):
@@ -1414,6 +1458,15 @@ class APIServerAdapter(BasePlatformAdapter):
         self._direct_model_requests: bool = _coerce_request_bool(
             extra.get("direct_model_requests"), default=False
         )
+        # split_runtime: when true, a chat-completions request may carry a
+        # ``tools`` array whose (shadowable) tools are relayed to the client
+        # for execution instead of running on the API-server host (the client
+        # returns results via ``role=tool`` messages in the next request).
+        # Off by default; server-side behaviour is unchanged unless this is
+        # set AND a request actually supplies shadowable tools.
+        self._split_runtime: bool = _coerce_request_bool(
+            extra.get("split_runtime", os.getenv("API_SERVER_SPLIT_RUNTIME", "")),
+        )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -1435,6 +1488,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Split-runtime chat turns keyed by the stable ``chat:{session_id}``
+        # relay key (the suspended-agent registry for /v1/chat/completions
+        # client-tool round trips).  Cleaned when the turn finishes; entries
+        # are lazily swept via a delayed done-callback cleanup.
+        self._chat_split_runs: Dict[str, ChatSplitState] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         # Last-known-good resolved model per session (keyed by gateway_session_key
         # ONLY — never session_id, which rotates/is ephemeral for one-off API
@@ -2598,6 +2656,8 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        extra_client_tools: Optional[List[Dict[str, Any]]] = None,
+        client_tool_session_key: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2925,7 +2985,100 @@ class APIServerAdapter(BasePlatformAdapter):
                 else "global"
             ),
         }
+
+        # Split-runtime: merge client/shell-supplied tools into the agent's
+        # tool list so the model can call them, but tag them so invoke_tool
+        # SUSPENDS + relays to the client instead of dispatching on the host.
+        # The agent is built fresh per run, but copy the (possibly shared)
+        # tool structures defensively before mutating.
+        if extra_client_tools:
+            agent.tools = list(agent.tools or [])
+            agent.valid_tool_names = set(getattr(agent, "valid_tool_names", set()) or set())
+            client_names: set = set()
+            client_defs: list = []
+            for _cdef in extra_client_tools:
+                _fn = (_cdef or {}).get("function", {}) or {}
+                _name = _fn.get("name")
+                if not _name:
+                    continue
+                client_defs.append(_fn)
+                # A client tool shadowing a same-named host tool wins: drop the
+                # host entry so the relay path handles it.  (Names colliding
+                # with agent-level dispatch tools are filtered upstream in
+                # _parse_split_client_tools before we get here.)
+                agent.tools = [
+                    t for t in agent.tools
+                    if (t.get("function", {}) or {}).get("name") != _name
+                ]
+                agent.tools.append({"type": "function", "function": _fn})
+                agent.valid_tool_names.add(_name)
+                client_names.add(_name)
+            agent._client_tool_names = client_names
+            # Stored so tools.mcp_tool._reinject_post_build_tools re-appends
+            # them when a turn-boundary rebuild refreshes agent.tools
+            # (otherwise the per-turn MCP rebuild strips runtime-injected
+            # client tools).
+            agent._client_tool_defs = client_defs
+            agent._client_tool_session_key = client_tool_session_key or session_id or ""
+            # The system prompt (with its <tools> block) is cached on the
+            # agent at build time -- invalidate it so the merged client tools
+            # appear in the model's tool documentation.
+            try:
+                agent._invalidate_system_prompt()
+            except Exception:
+                agent._cached_system_prompt = None
+
         return agent
+
+    def _split_runtime_enabled(self) -> bool:
+        """Whether split-runtime (client-tool relay) is enabled.
+
+        Resolved from, in order:
+
+          1. ``platforms.api_server.extra.split_runtime`` (adapter config),
+          2. the ``API_SERVER_SPLIT_RUNTIME`` environment variable,
+          3. the profile config's top-level ``api_server: split_runtime:``
+             block -- the same place ``gateway_timeout`` and the other
+             api_server knobs live.
+
+        (3) is a fallback rather than the primary source because the adapter's
+        ``extra`` is the canonical platform-config channel; it exists because
+        the top-level block is where an operator naturally puts this and the
+        shared-key bridge in ``gateway.config`` does not carry the key into
+        ``extra``.
+
+        (1) and (2) are adapter-wide.  (3) is resolved **per profile**: under
+        ``gateway.multiplex_profiles`` one adapter serves every profile, and
+        the request middleware has already entered the routed profile's
+        runtime scope, so ``load_config()`` here reads that profile's config.
+        The result is memoized per profile name -- caching a single value
+        would let whichever profile issued the first request decide the flag
+        for all of them.
+
+        Off by default: only when it is true AND a request actually carries
+        a shadowable ``tools`` entry does the relay path activate, so existing
+        server-side behaviour is untouched.
+        """
+        if self._split_runtime:
+            return True
+        # "" is the un-prefixed/single-profile case (the default profile).
+        profile_key = _api_request_profile.get() or ""
+        cache = getattr(self, "_split_runtime_config_cache", None)
+        if cache is None:
+            cache = {}
+            self._split_runtime_config_cache = cache
+        if profile_key not in cache:
+            try:
+                from hermes_cli.config import load_config
+
+                cfg = load_config() or {}
+                api_cfg = cfg.get("api_server", {}) or {}
+                cache[profile_key] = _coerce_request_bool(
+                    api_cfg.get("split_runtime", False)
+                )
+            except Exception:
+                cache[profile_key] = False
+        return cache[profile_key]
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -4070,10 +4223,23 @@ class APIServerAdapter(BasePlatformAdapter):
             history = conversation_messages[:-1]
 
         if not _content_has_visible_payload(user_message):
-            return web.json_response(
-                {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
-                status=400,
+            # Split-runtime resume: a follow-up request carrying a role=tool
+            # result has no new user message by construction -- the agent
+            # turn is already parked waiting for that result.  Skip this
+            # gate so the split decision block below can resolve the pending
+            # call; it re-validates the session there (a missing/expired
+            # state yields 409 no_active_turn, not this 400).
+            _session_header = request.headers.get("X-Hermes-Session-Id", "").strip()
+            _is_split_resume = (
+                self._split_runtime_enabled()
+                and any(m.get("role") == "tool" for m in messages)
+                and bool(_session_header)
             )
+            if not _is_split_resume:
+                return web.json_response(
+                    {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
+                    status=400,
+                )
 
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This
@@ -4165,6 +4331,73 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
+
+        # ---- Split-runtime (client-executed tools) ----
+        # When ``api_server.split_runtime`` is enabled and this request
+        # supplies shadowable client tools (or resumes a suspended split turn
+        # with a ``role=tool`` result), the agent runs on the server but the
+        # shadowed tools execute on the CLIENT (e.g. TRAE on the user's
+        # Windows box).  The HTTP response carries standard OpenAI
+        # ``tool_calls`` (finish_reason="tool_calls") so the client can run
+        # them locally and hand the results back via ``role=tool``.
+        if self._split_runtime_enabled():
+            relay_key = f"chat:{session_id}"
+            state = self._chat_split_runs.get(relay_key)
+            client_tools = self._parse_split_client_tools(body)
+            tool_results = [m for m in messages if m.get("role") == "tool"]
+
+            if tool_results and state is None:
+                return web.json_response(
+                    _openai_error(
+                        "No active agent turn for this session; cannot deliver a tool result "
+                        "(the turn may have timed out or ended). Start a new request.",
+                        code="no_active_turn",
+                    ),
+                    status=409,
+                )
+            if state is not None and (state.agent_task.done() or state.finished):
+                # Previous turn ended (completed, failed, or relay timeout).
+                # A late tool result can no longer be delivered.
+                self._chat_split_runs.pop(relay_key, None)
+                if tool_results:
+                    return web.json_response(
+                        _openai_error(
+                            "This session's agent turn already ended; cannot deliver the tool result.",
+                            code="turn_finished",
+                        ),
+                        status=409,
+                    )
+                state = None
+            if state is not None and not tool_results:
+                return web.json_response(
+                    _openai_error(
+                        "This session's agent is waiting for a client tool result; "
+                        "include the role=tool message with tool_call_id to resume.",
+                        code="agent_waiting_for_tool",
+                    ),
+                    status=409,
+                )
+
+            if state is not None or client_tools:
+                return await self._run_split_chat(
+                    request=request,
+                    body=body,
+                    stream=stream,
+                    completion_id=completion_id,
+                    model_name=model_name,
+                    created=created,
+                    session_id=session_id,
+                    relay_key=relay_key,
+                    state=state,
+                    client_tools=client_tools,
+                    tool_results=tool_results,
+                    user_message=user_message,
+                    conversation_history=history,
+                    system_prompt=system_prompt,
+                    gateway_session_key=gateway_session_key,
+                    route=route,
+                    agent_overrides=agent_overrides,
+                )
 
         if stream:
             _stream_q = ThreadSafeAsyncQueue()
@@ -4298,6 +4531,31 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
+        return self._build_chat_completion_response(
+            completion_id=completion_id,
+            model_name=model_name,
+            created=created,
+            session_id=session_id,
+            gateway_session_key=gateway_session_key,
+            result=result,
+            usage=usage,
+        )
+
+    def _build_chat_completion_response(
+        self, *,
+        completion_id: str,
+        model_name: str,
+        created: int,
+        session_id: str,
+        gateway_session_key: Optional[str],
+        result: dict,
+        usage: dict,
+    ) -> "web.Response":
+        """Build the non-streaming chat.completion response from an agent result.
+
+        Shared by the plain turn and the split-runtime turn (where the agent
+        finished after zero or more client-tool round trips).
+        """
         final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
@@ -4377,6 +4635,480 @@ class APIServerAdapter(BasePlatformAdapter):
                 response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
 
         return web.json_response(response_data, headers=response_headers)
+
+    async def _run_split_chat(
+        self, *,
+        request: "web.Request",
+        body: dict,
+        stream: bool,
+        completion_id: str,
+        model_name: str,
+        created: int,
+        session_id: str,
+        relay_key: str,
+        state: Optional[ChatSplitState],
+        client_tools: List[Dict[str, Any]],
+        tool_results: list,
+        user_message: str,
+        conversation_history: list,
+        system_prompt: Optional[str],
+        gateway_session_key: Optional[str],
+        route: Optional[Dict[str, Any]],
+        agent_overrides: dict,
+    ) -> "web.StreamResponse":
+        """Run a split-runtime chat turn (client-executed tools).
+
+        First request of a turn (``state is None``): build the agent with the
+        client's shadowable tools and start it as a background task.  The
+        agent thread SUSPENDS inside ``client_tool_gateway.wait_for_result``
+        whenever the model calls a client tool; the notify callback below
+        wakes this handler so it can return a standard OpenAI ``tool_calls``
+        response while the agent stays alive.
+
+        Resume request (``state`` present, carries ``role=tool`` messages):
+        resolve the pending client tool calls with the supplied results, then
+        wait for the next ``tool_calls`` suspension or the final answer.
+        """
+        from tools import client_tool_gateway as _ctg
+
+        if state is None:
+            stream_q = ThreadSafeAsyncQueue()
+            agent_ref: list = [None]
+
+            def _notify(entry):
+                # Runs on the agent executor thread -- must not touch the
+                # event loop directly (put_threadsafe bridges via
+                # call_soon_threadsafe).
+                try:
+                    stream_q.put_threadsafe(("__client_tool_call__", entry.signature()))
+                except Exception:
+                    logger.debug(
+                        "[api_server] split-runtime notify enqueue failed",
+                        exc_info=True,
+                    )
+
+            def _on_done(fut):
+                # Runs on the event loop thread.  Populate the state so the
+                # waiting handler can build the final response, then sweep
+                # the state entry a TTL after the turn ends (a stale session
+                # id must not pin it forever).
+                try:
+                    state.finished = True
+                    if fut.cancelled():
+                        state.error = "split-runtime agent task cancelled"
+                    else:
+                        exc = fut.exception()
+                        if exc is not None:
+                            state.error = f"split-runtime agent task failed: {exc}"
+                        else:
+                            state.result, state.usage = fut.result()
+                    stream_q.put_nowait(("__agent_done__", None))
+                except Exception:
+                    logger.debug(
+                        "[api_server] split-runtime done callback failed",
+                        exc_info=True,
+                    )
+                try:
+                    asyncio.get_event_loop().call_later(
+                        CHAT_COMPLETIONS_SPLIT_STATE_TTL,
+                        lambda: self._chat_split_runs.pop(relay_key, None),
+                    )
+                except Exception:
+                    pass
+
+            agent_task = asyncio.ensure_future(self._run_agent(
+                user_message=user_message,
+                conversation_history=conversation_history,
+                ephemeral_system_prompt=system_prompt,
+                session_id=session_id,
+                stream_delta_callback=stream_q.put_threadsafe if stream else None,
+                agent_ref=agent_ref,
+                gateway_session_key=gateway_session_key,
+                **agent_overrides,
+                route=route,
+                extra_client_tools=client_tools,
+                client_tool_session_key=relay_key,
+                client_tool_notify_cb=_notify,
+            ))
+            state = ChatSplitState(
+                session_id=session_id,
+                relay_key=relay_key,
+                agent_task=agent_task,
+                agent_ref=agent_ref,
+                stream_q=stream_q,
+                client_tool_names={
+                    (t.get("function", {}) or {}).get("name", "")
+                    for t in client_tools if isinstance(t, dict)
+                },
+            )
+            agent_task.add_done_callback(_on_done)
+            self._chat_split_runs[relay_key] = state
+        else:
+            # Resume: deliver the role=tool results to the suspended agent
+            # thread, one resolve per tool_call_id.
+            for tm in tool_results:
+                call_id = tm.get("tool_call_id") or ""
+                content = self._chat_tool_result_content(tm)
+                if not _ctg.resolve_client_tool(relay_key, call_id, content):
+                    self._chat_split_runs.pop(relay_key, None)
+                    return web.json_response(
+                        _openai_error(
+                            f"No pending client tool call with id '{call_id}' in this session.",
+                            code="tool_call_not_pending",
+                        ),
+                        status=409,
+                    )
+
+        if stream:
+            return await self._write_split_sse(
+                request=request,
+                completion_id=completion_id,
+                model_name=model_name,
+                created=created,
+                state=state,
+                gateway_session_key=gateway_session_key,
+            )
+
+        # Non-streaming: wait for the turn to end (final answer) or for the
+        # agent to suspend on the next client tool call.
+        while True:
+            try:
+                item = await asyncio.wait_for(state.stream_q.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                if state.agent_task.done():
+                    break
+                continue
+
+            if isinstance(item, tuple) and len(item) == 2 and item[0] == "__client_tool_call__":
+                payload = item[1]
+                return self._build_tool_calls_response(
+                    completion_id=completion_id,
+                    model_name=model_name,
+                    created=created,
+                    session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                    call_id=payload.get("call_id") or "",
+                    name=payload.get("name") or "",
+                    arguments=payload.get("arguments") or {},
+                )
+            if isinstance(item, tuple) and len(item) == 2 and item[0] == "__agent_done__":
+                break
+
+        # Turn ended.  Collect the authoritative result from the task itself
+        # (the done callback may not have run yet when the 0.5s poll caught
+        # the finished task).
+        self._chat_split_runs.pop(relay_key, None)
+        if state.error is None:
+            try:
+                state.result, state.usage = await state.agent_task
+            except asyncio.CancelledError:
+                state.error = "split-runtime agent task cancelled"
+            except Exception as exc:
+                state.error = f"split-runtime agent task failed: {exc}"
+        if state.error:
+            logger.error("Split-runtime agent task failed: %s", state.error)
+            return web.json_response(
+                _openai_error(
+                    f"Internal server error: {state.error}",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+        return self._build_chat_completion_response(
+            completion_id=completion_id,
+            model_name=model_name,
+            created=created,
+            session_id=session_id,
+            gateway_session_key=gateway_session_key,
+            result=state.result or {},
+            usage=state.usage or {},
+        )
+
+    def _parse_split_client_tools(self, body: dict) -> List[Dict[str, Any]]:
+        """Extract shadowable client tools from an OpenAI ``tools`` array.
+
+        Only names in ``CLIENT_SHADOWABLE_TOOLS`` participate in the relay.
+        Any other name the client declares (web_search, memory, mcp_*, ...)
+        is intentionally ignored -- Hermes keeps executing its own
+        server-side implementation for those, per the tool-precedence rule:
+        a client-declared shadowable tool wins; everything else stays on the
+        server.  Malformed entries and duplicates are skipped.
+        """
+        seen: set = set()
+        result: List[Dict[str, Any]] = []
+        for t in body.get("tools") or []:
+            if not isinstance(t, dict):
+                continue
+            fn = t.get("function")
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name")
+            if not isinstance(name, str) or name not in CLIENT_SHADOWABLE_TOOLS:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            result.append({"type": "function", "function": fn})
+        return result
+
+    def _build_tool_calls_response(
+        self, *,
+        completion_id: str,
+        model_name: str,
+        created: int,
+        session_id: str,
+        gateway_session_key: Optional[str],
+        call_id: str,
+        name: str,
+        arguments: Any,
+    ) -> "web.Response":
+        """Build a non-streaming response that relays a client tool call.
+
+        Standard OpenAI shape: assistant message with ``tool_calls`` and
+        ``finish_reason: "tool_calls"``.  The agent stays alive, suspended on
+        the relay; the client executes the tool locally and resumes via a
+        ``role=tool`` message in its next request.
+        """
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        response_data = {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+        headers = {"X-Hermes-Session-Id": session_id}
+        if gateway_session_key:
+            headers["X-Hermes-Session-Key"] = gateway_session_key
+        return web.json_response(response_data, headers=headers)
+
+    @staticmethod
+    def _chat_tool_result_content(message: dict) -> str:
+        """Normalize a ``role=tool`` message's content for the relay result."""
+        content = message.get("content")
+        if content is None:
+            return ""
+        if isinstance(content, (dict, list)):
+            return json.dumps(content, ensure_ascii=False)
+        return str(content)
+
+    async def _write_split_sse(
+        self, *,
+        request: "web.Request",
+        completion_id: str,
+        model_name: str,
+        created: int,
+        state: ChatSplitState,
+        gateway_session_key: Optional[str],
+    ) -> "web.StreamResponse":
+        """SSE writer for one phase of a split-runtime turn.
+
+        Unlike the plain streaming writer, the stream does NOT end when the
+        agent suspends on a client tool call: it emits a ``tool_calls`` chunk
+        with ``finish_reason: "tool_calls"`` plus ``[DONE]`` and returns,
+        leaving the agent parked on the relay.  The client's next request
+        (``role=tool``) resumes it, and the handler re-enters this writer for
+        the next phase of the same turn.
+        """
+        sse_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        origin = request.headers.get("Origin", "")
+        cors = self._cors_headers_for_origin(origin) if origin else None
+        if cors:
+            sse_headers.update(cors)
+        if state.session_id:
+            sse_headers["X-Hermes-Session-Id"] = state.session_id
+        if gateway_session_key:
+            sse_headers["X-Hermes-Session-Key"] = gateway_session_key
+        response = web.StreamResponse(status=200, headers=sse_headers)
+        await response.prepare(request)
+
+        try:
+            last_activity = time.monotonic()
+            role_chunk = {
+                "id": completion_id, "object": "chat.completion.chunk",
+                "created": created, "model": model_name,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            }
+            await response.write(_sse_frame(role_chunk))
+            last_activity = time.monotonic()
+
+            emitted_tool_call = False
+            while True:
+                try:
+                    item = await asyncio.wait_for(state.stream_q.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    if state.agent_task.done():
+                        break
+                    if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
+                        await response.write(b": keepalive\n\n")
+                        last_activity = time.monotonic()
+                    continue
+
+                if item is None:
+                    # The agent's close-box sentinel
+                    # (``stream_delta_callback(None)``); not an end-of-stream
+                    # marker on the split path.
+                    continue
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__client_tool_call__":
+                    payload = item[1]
+                    # The agent is now parked on the relay; emit the tool call
+                    # and end THIS phase of the stream.  The agent task stays
+                    # alive so the next request can resume it.  Two chunks per
+                    # the standard OpenAI streaming shape: the delta carrying
+                    # the tool_calls, then an empty delta closing with
+                    # finish_reason="tool_calls" (clients accumulate the call
+                    # from the first and read the finish from the second).
+                    tool_call_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": payload.get("call_id") or "",
+                                    "type": "function",
+                                    "function": {
+                                        "name": payload.get("name") or "",
+                                        "arguments": json.dumps(
+                                            payload.get("arguments") or {},
+                                            ensure_ascii=False,
+                                        ),
+                                    },
+                                }],
+                            },
+                            "finish_reason": None,
+                        }],
+                    }
+                    await response.write(_sse_frame(tool_call_chunk))
+                    finish_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model_name,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                    }
+                    await response.write(_sse_frame(finish_chunk))
+                    emitted_tool_call = True
+                    break
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__agent_done__":
+                    break
+                # Plain content delta.
+                content_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model_name,
+                    "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                }
+                await response.write(_sse_frame(content_chunk))
+                last_activity = time.monotonic()
+
+            if emitted_tool_call:
+                # Phase ended with the agent parked on a client tool call.
+                await response.write(b"data: [DONE]\n\n")
+                return response
+
+            # Agent finished the turn: emit the finish chunk.
+            usage = state.usage or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            result = state.result or {}
+            is_partial = bool(result.get("partial"))
+            is_failed = bool(result.get("failed"))
+            completed = bool(result.get("completed", True))
+            err_msg = result.get("error")
+            if state.error:
+                is_failed = True
+                err_msg = err_msg or state.error
+            if is_partial and err_msg and "truncat" in err_msg.lower():
+                finish_reason = "length"
+            elif state.error or is_failed or (not completed and err_msg):
+                finish_reason = "error"
+            else:
+                finish_reason = "stop"
+            finish_chunk = {
+                "id": completion_id, "object": "chat.completion.chunk",
+                "created": created, "model": model_name,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                "usage": {
+                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+            }
+            if finish_reason != "stop":
+                finish_chunk["hermes"] = {
+                    "completed": completed,
+                    "partial": is_partial,
+                    "failed": is_failed,
+                    "error": err_msg,
+                    "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                }
+            await response.write(_sse_frame(finish_chunk))
+            await response.write(b"data: [DONE]\n\n")
+            return response
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+            # Client disconnected mid-phase.  Interrupt the agent so it stops
+            # making LLM API calls at the next loop iteration, then cancel
+            # the asyncio task wrapper.  Unlike the plain streaming writer
+            # the agent may be parked on the relay rather than in an LLM
+            # call -- request_hard_interrupt + cancel unwind both cases.
+            agent = state.agent_ref[0] if state.agent_ref else None
+            if agent is not None:
+                try:
+                    request_hard_interrupt(agent, "SSE client disconnected")
+                except Exception:
+                    pass
+                _reap_disconnected_agent_processes(agent)
+            if not state.agent_task.done():
+                state.agent_task.cancel()
+                try:
+                    await state.agent_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._chat_split_runs.pop(state.relay_key, None)
+            logger.info("SSE client disconnected; interrupted split-runtime task %s", completion_id)
+        except Exception as _exc:
+            # Agent crashed mid-stream.  Try to emit an error chunk so the
+            # client gets a proper response instead of a TransferEncodingError
+            # from incomplete chunked encoding.
+            import traceback as _tb
+            logger.error(
+                "Split-runtime agent crashed mid-stream for %s: %s",
+                completion_id, _tb.format_exc()[:300],
+            )
+            self._chat_split_runs.pop(state.relay_key, None)
+            try:
+                error_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model_name,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                }
+                await response.write(_sse_frame(error_chunk))
+                await response.write(b"data: [DONE]\n\n")
+            except Exception:
+                pass
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
@@ -6119,6 +6851,9 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        extra_client_tools: Optional[List[Dict[str, Any]]] = None,
+        client_tool_session_key: Optional[str] = None,
+        client_tool_notify_cb=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6144,6 +6879,14 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
+
+        *extra_client_tools* / *client_tool_session_key* / *client_tool_notify_cb*
+        carry the split-runtime contract (see ``_create_agent``): the agent is
+        built with the client-supplied tool defs, and a per-turn notify
+        callback is registered against ``client_tool_gateway`` so the
+        executor thread can signal the HTTP layer when the model calls a
+        client tool.  The callback runs on the agent thread and must be
+        thread-safe (typically a ``ThreadSafeAsyncQueue.put_threadsafe``).
         """
         loop = asyncio.get_running_loop()
         # Capture before hopping to the executor — ContextVars do not follow
@@ -6176,6 +6919,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        extra_client_tools=extra_client_tools,
+                        client_tool_session_key=client_tool_session_key,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
@@ -6193,6 +6938,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``agent_ref``, and only /v1/runs has a run_id, so neither
                     # is a usable hook for the rest.
                     self._shutdown_interruptible_agents[id(agent)] = agent
+                    # Split-runtime: register the per-turn client-tool notify
+                    # hook so relay_client_tool can wake the HTTP layer when
+                    # the model calls a client-supplied tool.  Unregistered in
+                    # the finally block below (which also cancels any pending
+                    # relay still blocked when the turn ends).
+                    if client_tool_session_key and client_tool_notify_cb is not None:
+                        try:
+                            from tools import client_tool_gateway as _ctg
+
+                            _ctg.register_notify(client_tool_session_key, client_tool_notify_cb)
+                        except Exception:
+                            logger.debug(
+                                "[api_server] client-tool notify registration failed for %s",
+                                client_tool_session_key, exc_info=True,
+                            )
                     result = agent.run_conversation(
                         user_message=user_message,
                         conversation_history=conversation_history,
@@ -6327,6 +7087,16 @@ class APIServerAdapter(BasePlatformAdapter):
                         # shutdown.  pop() is a no-op when _create_agent
                         # succeeded but the turn never reached registration.
                         self._shutdown_interruptible_agents.pop(id(agent), None)
+                    # Split-runtime: drop the per-turn notify hook and cancel
+                    # any relay still pending (a client that never answers
+                    # would otherwise leave the entry until the relay timeout).
+                    if client_tool_session_key:
+                        try:
+                            from tools import client_tool_gateway as _ctg
+
+                            _ctg.unregister_notify(client_tool_session_key)
+                        except Exception:
+                            pass
                     clear_session_vars(tokens)
 
         self._activate_admitted_request()
