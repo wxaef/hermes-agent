@@ -58,7 +58,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -761,6 +761,64 @@ def _content_has_visible_payload(content: Any) -> bool:
                 if ptype in _IMAGE_PART_TYPES:
                     return True
     return False
+
+
+def _tool_results_link_to_history(tool_results: list, messages: list) -> bool:
+    """True when every ``role=tool`` message's ``tool_call_id`` matches an
+    ``assistant`` ``tool_calls`` entry in the same request's history.
+
+    Standard OpenAI message-chain check: a tool result is only meaningful
+    after the assistant call that produced it.  Used to decide whether a
+    tool result arriving without a live split turn is a legitimate late
+    result (relay timeout, process restart, TTL sweep) that can be folded
+    into a fresh turn, or an orphan message that must be rejected.
+    """
+    call_ids = set()
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc, dict) and tc.get("id"):
+                call_ids.add(tc.get("id"))
+    if not call_ids:
+        return False
+    return all((tm.get("tool_call_id") or "") in call_ids for tm in tool_results)
+
+
+def _rebuild_stale_resume(messages: list) -> Tuple[str, list]:
+    """Rebuild a stale tool-result request into a runnable fresh turn.
+
+    ``user_message``/``conversation_history`` are normally extracted from
+    user+assistant messages only, but a stale-resume request ends with a
+    ``role=tool`` message.  Rebuild the history from the raw request with
+    the tool results in place (right after their assistant ``tool_calls``)
+    and reuse the last visible user message as the new turn's input -- the
+    model sees the completed tool chain and continues from where the lost
+    turn died.
+    """
+    normalized = []
+    for m in messages:
+        role = m.get("role", "")
+        if role == "system":
+            continue
+        if role in {"user", "assistant"}:
+            try:
+                content = _normalize_multimodal_content(m.get("content", ""))
+            except ValueError:
+                content = _normalize_chat_content(m.get("content", ""))
+            extra = {k: v for k, v in m.items() if k not in ("role", "content")}
+            normalized.append({"role": role, "content": content, **extra})
+        else:
+            normalized.append(dict(m))
+    last_user_idx = -1
+    for i, cm in enumerate(normalized):
+        if cm.get("role") == "user" and _content_has_visible_payload(cm.get("content", "")):
+            last_user_idx = i
+    if last_user_idx < 0:
+        return "", normalized
+    user_message = normalized[last_user_idx].get("content", "")
+    history = normalized[:last_user_idx] + normalized[last_user_idx + 1:]
+    return user_message, history
 
 
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
@@ -4295,6 +4353,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         break
                 _derived_sid = _derive_chat_session_id(system_prompt, _first_user)
                 _is_split_resume = f"chat:{_derived_sid}" in self._chat_split_runs
+                if not _is_split_resume:
+                    # No live turn: accept only when the tool-result message
+                    # chain is complete -- a late result for a turn that
+                    # timed out or was lost (restart) can be folded into a
+                    # fresh turn downstream (stale-resume degrade); an
+                    # orphan role=tool message is still rejected.
+                    _tool_msgs = [m for m in messages if m.get("role") == "tool"]
+                    _is_split_resume = _tool_results_link_to_history(_tool_msgs, messages)
             if not _is_split_resume:
                 return web.json_response(
                     {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
@@ -4414,15 +4480,40 @@ class APIServerAdapter(BasePlatformAdapter):
                 len(tool_results),
             )
 
+            stale_resume = False
             if tool_results and state is None:
-                return web.json_response(
-                    _openai_error(
-                        "No active agent turn for this session; cannot deliver a tool result "
-                        "(the turn may have timed out or ended). Start a new request.",
-                        code="no_active_turn",
-                    ),
-                    status=409,
-                )
+                # No live turn for this session (relay timeout, process
+                # restart, TTL sweep).  A client shell that treats Hermes as
+                # a pure LLM provider (TRAE) may still deliver a late
+                # role=tool result; when the message chain is complete
+                # (every tool_call_id matches an assistant tool_calls in the
+                # history) degrade to a fresh turn carrying the results, so
+                # the model continues from where the lost turn died instead
+                # of the client seeing a hard 409.  Orphan tool messages
+                # (no matching assistant call) still fail closed.
+                if _tool_results_link_to_history(tool_results, messages):
+                    _stale_user, _stale_history = _rebuild_stale_resume(messages)
+                    if not _content_has_visible_payload(_stale_user):
+                        return web.json_response(
+                            _openai_error(
+                                "No active agent turn for this session; cannot deliver a tool result "
+                                "(the turn may have timed out or ended). Start a new request.",
+                                code="no_active_turn",
+                            ),
+                            status=409,
+                        )
+                    user_message = _stale_user
+                    history = _stale_history
+                    stale_resume = True
+                else:
+                    return web.json_response(
+                        _openai_error(
+                            "No active agent turn for this session; cannot deliver a tool result "
+                            "(the turn may have timed out or ended). Start a new request.",
+                            code="no_active_turn",
+                        ),
+                        status=409,
+                    )
             if state is not None and (state.agent_task.done() or state.finished):
                 # Previous turn ended (completed, failed, or relay timeout).
                 # A late tool result can no longer be delivered.
@@ -4446,7 +4537,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=409,
                 )
 
-            if state is not None or client_tools:
+            if state is not None or client_tools or stale_resume:
                 return await self._run_split_chat(
                     request=request,
                     body=body,

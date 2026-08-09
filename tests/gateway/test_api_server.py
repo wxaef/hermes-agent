@@ -3096,40 +3096,63 @@ class TestSplitRuntimeChatCompletions:
         assert ctg.has_pending(f"chat:{derived}") is False
 
     @pytest.mark.asyncio
-    async def test_tool_result_without_live_turn_still_rejected(self, monkeypatch):
-        """A stray role=tool request with no parked turn and no session
-        header must not slip through as a bogus empty-message turn -- it
-        stays a 400 (no derived-session state exists to resume)."""
+    async def test_tool_result_without_live_turn_degrades_with_complete_chain(self, monkeypatch):
+        """A role=tool request with no parked turn AND no session header
+        must not slip through as a bogus empty-message turn -- but with a
+        complete message chain (every tool_call_id links to an assistant
+        tool_calls in the history) the 400 gate opens and the request
+        degrades into a fresh turn carrying the late result."""
         from tools import client_tool_gateway as ctg
 
         adapter = self._make_split_adapter()
         app = _create_app(adapter)
         monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
 
+        seen = {}
+        mock_agent = MagicMock()
+
+        def fake_run_conversation(user_message, conversation_history, task_id):
+            seen["user_message"] = user_message
+            seen["history"] = conversation_history
+            return {"final_response": "continued", "session_id": "derived-noheader"}
+
+        mock_agent.run_conversation.side_effect = fake_run_conversation
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+
         auth_only = {"Authorization": "Bearer sk-secret"}
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/v1/chat/completions",
-                headers=auth_only,
-                json={
-                    "model": "test-model",
-                    "messages": [
-                        {"role": "user", "content": "search for hermes"},
-                        {
-                            "role": "assistant",
-                            "content": "",
-                            "tool_calls": [{
-                                "id": "call_stray",
-                                "type": "function",
-                                "function": {"name": "search_files", "arguments": "{}"},
-                            }],
-                        },
-                        {"role": "tool", "tool_call_id": "call_stray", "content": "{}"},
-                    ],
-                },
-            )
-            assert resp.status == 400
-            assert "No user message found" in (await resp.json())["error"]["message"]
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers=auth_only,
+                    json={
+                        "model": "test-model",
+                        "messages": [
+                            {"role": "user", "content": "search for hermes"},
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": "call_stray",
+                                    "type": "function",
+                                    "function": {"name": "search_files", "arguments": "{}"},
+                                }],
+                            },
+                            {"role": "tool", "tool_call_id": "call_stray", "content": "{}"},
+                        ],
+                    },
+                )
+                assert resp.status == 200, await resp.text()
+                body = await resp.json()
+                assert body["choices"][0]["message"]["content"] == "continued"
+                # Degraded turn: last user message reused as the new user
+                # prompt; history carries the tool chain that followed it
+                # (assistant tool_calls -> tool result).
+                assert seen["user_message"] == "search for hermes"
+                assert [m["role"] for m in seen["history"]] == ["assistant", "tool"]
+                assert seen["history"][-1]["tool_call_id"] == "call_stray"
 
     @pytest.mark.asyncio
     async def test_multi_round_client_tools_keep_same_agent(self, monkeypatch):
@@ -3804,6 +3827,133 @@ class TestSplitRuntimeChatCompletions:
 
         assert ctg.resolve_client_tool("chat:never-registered", "call_x", "{}") is False
         assert ctg.has_pending("chat:never-registered") is False
+
+    @pytest.mark.asyncio
+    async def test_stale_tool_result_degrades_to_fresh_turn(self, monkeypatch):
+        """A role=tool result arriving after the split turn was lost (relay
+        timeout, process restart, TTL sweep) must not hard-409 a pure-
+        provider client like TRAE: with a complete message chain it degrades
+        into a fresh turn carrying the late result, and the model continues
+        from where the lost turn died."""
+        from agent.agent_runtime_helpers import relay_client_tool
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        session_id = "split-session-stale"
+        seen = {}
+        mock_agent = MagicMock()
+        phase = {"n": 0}
+
+        def fake_run_conversation(user_message, conversation_history, task_id):
+            # First call (fresh turn): suspends on the client tool and the
+            # HTTP layer returns tool_calls.  Second call (degraded fresh
+            # turn): carries the rebuilt chain and finishes immediately.
+            phase["n"] += 1
+            if phase["n"] == 1:
+                relay_client_tool(mock_agent, "Read", {}, "call_0001")
+                return {"final_response": "phase1 done", "session_id": session_id}
+            seen["user_message"] = user_message
+            seen["history"] = conversation_history
+            return {"final_response": "continued", "session_id": session_id}
+
+        mock_agent.run_conversation.side_effect = fake_run_conversation
+        mock_agent._client_tool_session_key = f"chat:{session_id}"
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+        headers = self._split_headers(session_id)
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            async with TestClient(TestServer(app)) as cli:
+                resp1 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "tools": [{"type": "function", "function": {"name": "Read", "description": "r"}}],
+                        "messages": [{"role": "user", "content": "edit x.md"}],
+                    },
+                )
+                assert resp1.status == 200, await resp1.text()
+                assert (await resp1.json())["choices"][0]["finish_reason"] == "tool_calls"
+
+                # Simulate the turn being lost (relay timeout / restart /
+                # TTL sweep): cancel the parked call and drop the state.
+                ctg.clear_session(f"chat:{session_id}")
+                adapter._chat_split_runs.pop(f"chat:{session_id}", None)
+
+                resp2 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "tools": [{"type": "function", "function": {"name": "Read", "description": "r"}}],
+                        "messages": [
+                            {"role": "user", "content": "edit x.md"},
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": "call_0001",
+                                    "type": "function",
+                                    "function": {"name": "Read", "arguments": "{}"},
+                                }],
+                            },
+                            {"role": "tool", "tool_call_id": "call_0001", "content": '"file contents"'},
+                        ],
+                    },
+                )
+                assert resp2.status == 200, await resp2.text()
+                body2 = await resp2.json()
+                assert body2["choices"][0]["message"]["content"] == "continued"
+                # Degraded turn: user message reused, history carries the
+                # tool chain in order (assistant -> tool) -- the original
+                # user prompt moved into the user_message slot.
+                assert seen["user_message"] == "edit x.md"
+                assert [m["role"] for m in seen["history"]] == ["assistant", "tool"]
+                assert seen["history"][-1]["tool_call_id"] == "call_0001"
+        # Let the phase-1 agent thread finish its relay timeout.
+        await asyncio.sleep(3.2)
+        assert ctg.has_pending(f"chat:{session_id}") is False
+
+    @pytest.mark.asyncio
+    async def test_orphan_tool_result_still_no_active_turn(self, monkeypatch):
+        """A role=tool message whose tool_call_id matches no assistant
+        tool_calls in the history (forged/corrupted) must still fail closed
+        with 409 no_active_turn when no live turn exists."""
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        headers = self._split_headers("split-session-orphan")
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": "test-model",
+                    "messages": [
+                        {"role": "user", "content": "edit x.md"},
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": "call_a",
+                                "type": "function",
+                                "function": {"name": "Read", "arguments": "{}"},
+                            }],
+                        },
+                        {"role": "tool", "tool_call_id": "call_bogus", "content": "x"},
+                    ],
+                },
+            )
+            assert resp.status == 409
+            body = await resp.json()
+            assert body["error"]["code"] == "no_active_turn"
 
     def test_parse_split_client_tools_filters(self):
         """Only shadowable names participate; duplicates and non-shadowable
