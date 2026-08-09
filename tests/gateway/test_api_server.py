@@ -3955,6 +3955,165 @@ class TestSplitRuntimeChatCompletions:
             body = await resp.json()
             assert body["error"]["code"] == "no_active_turn"
 
+    @pytest.mark.asyncio
+    async def test_turn_finished_tool_result_degrades_to_fresh_turn(self, monkeypatch):
+        """A client shell (TRAE local skills) may keep delivering tool
+        results AFTER the model already answered and the turn ended (state
+        present but agent_task done).  With a complete message chain the
+        late result degrades into a fresh turn instead of a hard 409
+        turn_finished."""
+        from agent.agent_runtime_helpers import relay_client_tool
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        session_id = "split-session-turn-finished"
+        seen = {}
+        mock_agent = MagicMock()
+        phase = {"n": 0}
+
+        def fake_run_conversation(user_message, conversation_history, task_id):
+            phase["n"] += 1
+            if phase["n"] == 1:
+                # Turn 1: suspends on the client tool; the HTTP layer
+                # returns tool_calls, the client delivers the result, the
+                # agent resumes (same run_conversation call) and the turn
+                # ENDS with a text answer.
+                relay_client_tool(mock_agent, "Read", {}, "call_0001")
+                return {"final_response": "done", "session_id": session_id}
+            # Turn 2 (degraded stale-resume): carries the late result.
+            seen["user_message"] = user_message
+            seen["history"] = conversation_history
+            return {"final_response": "continued", "session_id": session_id}
+
+        mock_agent.run_conversation.side_effect = fake_run_conversation
+        mock_agent._client_tool_session_key = f"chat:{session_id}"
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+        headers = self._split_headers(session_id)
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            async with TestClient(TestServer(app)) as cli:
+                # Phase 1: fresh turn suspends on Read.
+                resp1 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "tools": [{"type": "function", "function": {"name": "Read", "description": "r"}}],
+                        "messages": [{"role": "user", "content": "edit x.md"}],
+                    },
+                )
+                assert resp1.status == 200, await resp1.text()
+                assert (await resp1.json())["choices"][0]["finish_reason"] == "tool_calls"
+
+                # Phase 2: the client delivers the result; the agent answers
+                # and the turn ends.  No follow-up HTTP request -- the state
+                # entry lingers (SSE / TTL-window semantics) with a done
+                # agent_task, which is exactly the turn_finished condition.
+                state_obj = adapter._chat_split_runs[f"chat:{session_id}"]
+                assert ctg.resolve_client_tool(f"chat:{session_id}", "call_0001", '"r1"')
+                await asyncio.wait_for(state_obj.agent_task, timeout=5)
+                assert state_obj.agent_task.done()
+
+                # Phase 3: the client shell delivers ANOTHER tool result
+                # after the turn ended -- complete chain degrades to a fresh
+                # turn rather than 409 turn_finished.
+                resp3 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "tools": [{"type": "function", "function": {"name": "Read", "description": "r"}}],
+                        "messages": [
+                            {"role": "user", "content": "edit x.md"},
+                            {"role": "assistant", "content": "", "tool_calls": [{
+                                "id": "call_0001", "type": "function",
+                                "function": {"name": "Read", "arguments": "{}"},
+                            }]},
+                            {"role": "tool", "tool_call_id": "call_0001", "content": '"r1 late"'},
+                        ],
+                    },
+                )
+                assert resp3.status == 200, await resp3.text()
+                body3 = await resp3.json()
+                assert body3["choices"][0]["message"]["content"] == "continued"
+                assert seen["user_message"] == "edit x.md"
+                assert [m["role"] for m in seen["history"]] == ["assistant", "tool"]
+                assert seen["history"][-1]["tool_call_id"] == "call_0001"
+        assert ctg.has_pending(f"chat:{session_id}") is False
+
+    @pytest.mark.asyncio
+    async def test_turn_finished_orphan_tool_result_still_rejected(self, monkeypatch):
+        """After the turn ended, a role=tool message whose tool_call_id
+        matches no assistant tool_calls in the history must still fail
+        closed with 409 turn_finished."""
+        from agent.agent_runtime_helpers import relay_client_tool
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        session_id = "split-session-turn-finished-orphan"
+        mock_agent = MagicMock()
+
+        def fake_run_conversation(user_message, conversation_history, task_id):
+            # Suspends on the client tool; after the result is delivered the
+            # agent resumes (same call) and the turn ENDS with a text answer.
+            relay_client_tool(mock_agent, "Read", {}, "call_0001")
+            return {"final_response": "done", "session_id": session_id}
+
+        mock_agent.run_conversation.side_effect = fake_run_conversation
+        mock_agent._client_tool_session_key = f"chat:{session_id}"
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+        headers = self._split_headers(session_id)
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            async with TestClient(TestServer(app)) as cli:
+                resp1 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "tools": [{"type": "function", "function": {"name": "Read", "description": "r"}}],
+                        "messages": [{"role": "user", "content": "edit x.md"}],
+                    },
+                )
+                assert resp1.status == 200, await resp1.text()
+                assert (await resp1.json())["choices"][0]["finish_reason"] == "tool_calls"
+
+                # Turn ends normally (result delivered, agent answers); the
+                # state entry lingers with a done agent_task (SSE / TTL-
+                # window semantics -- the turn_finished condition).
+                state_obj = adapter._chat_split_runs[f"chat:{session_id}"]
+                assert ctg.resolve_client_tool(f"chat:{session_id}", "call_0001", '"r1"')
+                await asyncio.wait_for(state_obj.agent_task, timeout=5)
+
+                # A forged/duplicated result (call_bogus) that links to no
+                # assistant tool_calls still 409s with turn_finished.
+                resp3 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "messages": [
+                            {"role": "user", "content": "edit x.md"},
+                            {"role": "assistant", "content": "", "tool_calls": [{
+                                "id": "call_0001", "type": "function",
+                                "function": {"name": "Read", "arguments": "{}"},
+                            }]},
+                            {"role": "tool", "tool_call_id": "call_bogus", "content": "x"},
+                        ],
+                    },
+                )
+                assert resp3.status == 409
+                body3 = await resp3.json()
+                assert body3["error"]["code"] == "turn_finished"
+
     def test_parse_split_client_tools_filters(self):
         """Only shadowable names participate; duplicates and non-shadowable
         names (web_search, mcp_*, ...) are skipped, not rejected."""

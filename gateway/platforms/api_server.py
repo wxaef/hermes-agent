@@ -821,6 +821,24 @@ def _rebuild_stale_resume(messages: list) -> Tuple[str, list]:
     return user_message, history
 
 
+def _try_stale_resume(tool_results: list, messages: list) -> Optional[Tuple[str, list]]:
+    """Attempt a stale-resume degrade for late tool results.
+
+    Returns ``(user_message, history)`` when every ``role=tool`` message
+    links to an ``assistant`` ``tool_calls`` entry in the same history AND a
+    visible user payload can be recovered -- the request can run as a fresh
+    turn carrying the late results.  Returns ``None`` otherwise (orphan tool
+    messages, or a chain with no reusable user prompt) so the caller keeps
+    its hard-409 fail-closed behavior.
+    """
+    if not _tool_results_link_to_history(tool_results, messages):
+        return None
+    stale_user, stale_history = _rebuild_stale_resume(messages)
+    if not _content_has_visible_payload(stale_user):
+        return None
+    return stale_user, stale_history
+
+
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
     """Translate a ``_normalize_multimodal_content`` ValueError into a 400 response."""
     raw = str(exc)
@@ -4491,21 +4509,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 # the model continues from where the lost turn died instead
                 # of the client seeing a hard 409.  Orphan tool messages
                 # (no matching assistant call) still fail closed.
-                if _tool_results_link_to_history(tool_results, messages):
-                    _stale_user, _stale_history = _rebuild_stale_resume(messages)
-                    if not _content_has_visible_payload(_stale_user):
-                        return web.json_response(
-                            _openai_error(
-                                "No active agent turn for this session; cannot deliver a tool result "
-                                "(the turn may have timed out or ended). Start a new request.",
-                                code="no_active_turn",
-                            ),
-                            status=409,
-                        )
-                    user_message = _stale_user
-                    history = _stale_history
-                    stale_resume = True
-                else:
+                _stale = _try_stale_resume(tool_results, messages)
+                if _stale is None:
                     return web.json_response(
                         _openai_error(
                             "No active agent turn for this session; cannot deliver a tool result "
@@ -4514,18 +4519,30 @@ class APIServerAdapter(BasePlatformAdapter):
                         ),
                         status=409,
                     )
+                user_message, history = _stale
+                stale_resume = True
             if state is not None and (state.agent_task.done() or state.finished):
                 # Previous turn ended (completed, failed, or relay timeout).
-                # A late tool result can no longer be delivered.
+                # A late tool result can no longer be delivered to the
+                # parked agent, but with a complete message chain it degrades
+                # into a fresh turn carrying the late results (stale-resume)
+                # -- a client shell (TRAE local skills) may keep delivering
+                # tool results after the model already answered, and a hard
+                # 409 strands its pipeline mid-task.  Orphan results still
+                # fail closed.
                 self._chat_split_runs.pop(relay_key, None)
                 if tool_results:
-                    return web.json_response(
-                        _openai_error(
-                            "This session's agent turn already ended; cannot deliver the tool result.",
-                            code="turn_finished",
-                        ),
-                        status=409,
-                    )
+                    _stale = _try_stale_resume(tool_results, messages)
+                    if _stale is None:
+                        return web.json_response(
+                            _openai_error(
+                                "This session's agent turn already ended; cannot deliver the tool result.",
+                                code="turn_finished",
+                            ),
+                            status=409,
+                        )
+                    user_message, history = _stale
+                    stale_resume = True
                 state = None
             if state is not None and not tool_results:
                 return web.json_response(
