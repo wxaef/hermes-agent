@@ -3725,6 +3725,77 @@ class TestSplitRuntimeChatCompletions:
                 assert seen["tool_result"] == '"file contents"'
         assert ctg.has_pending(f"chat:{session_id}") is False
 
+    @pytest.mark.asyncio
+    async def test_trae_searchreplace_shadows_patch_and_relays(self, monkeypatch):
+        """TRAE declares SearchReplace; it must shadow Hermes' server-side
+        patch (whose host execution would hit HERMES_WRITE_SAFE_ROOT on the
+        container FS for a Windows workspace path) and relay the edit back
+        to the client instead."""
+        from agent.agent_runtime_helpers import relay_client_tool
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        session_id = "split-session-trae"
+        seen = {}
+        mock_agent = MagicMock()
+
+        def fake_run_conversation(user_message, conversation_history, task_id):
+            raw = relay_client_tool(
+                mock_agent,
+                "SearchReplace",
+                {"file_path": "x.md", "old_string": "a", "new_string": "b"},
+                "call_0003",
+            )
+            seen["tool_result"] = raw
+            return {"final_response": "edited", "session_id": session_id}
+
+        mock_agent.run_conversation.side_effect = fake_run_conversation
+        mock_agent._client_tool_session_key = f"chat:{session_id}"
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+        headers = self._split_headers(session_id)
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            async with TestClient(TestServer(app)) as cli:
+                resp1 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "SearchReplace",
+                                "description": "Edit",
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                        }],
+                        "messages": [{"role": "user", "content": "edit x.md"}],
+                    },
+                )
+                assert resp1.status == 200, await resp1.text()
+                assert (await resp1.json())["choices"][0]["finish_reason"] == "tool_calls"
+
+                resp2 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "messages": [
+                            {"role": "user", "content": "edit x.md"},
+                            {"role": "tool", "tool_call_id": "call_0003", "content": '"edited ok"'},
+                        ],
+                    },
+                )
+                assert resp2.status == 200, await resp2.text()
+                body2 = await resp2.json()
+                assert body2["choices"][0]["message"]["content"] == "edited"
+                assert seen["tool_result"] == '"edited ok"'
+        assert ctg.has_pending(f"chat:{session_id}") is False
+
     def test_resolve_unknown_session_returns_false(self):
         """A tool result for a session with no pending entry (and no exact
         call_id anywhere) must still fail closed at the gateway layer --
@@ -3751,6 +3822,38 @@ class TestSplitRuntimeChatCompletions:
         tools = adapter._parse_split_client_tools(body)
         assert [t["function"]["name"] for t in tools] == ["search_files"]
         assert tools[0]["function"]["description"] == "s"
+
+    def test_parse_split_client_tools_trae_ide_names(self):
+        """TRAE declares its IDE tools under Claude-Code-style camelCase
+        names (Read/Write/Glob/Grep/SearchReplace/RunCommand/...).  The
+        shadowable ones participate in the relay with their client-side
+        names intact; IDE tools with no Hermes counterpart (DeleteFile,
+        LS) are ignored so the server keeps its own implementations."""
+        adapter = _make_adapter()
+        body = {
+            "tools": [
+                {"type": "function", "function": {"name": "Read", "description": "r"}},
+                {"type": "function", "function": {"name": "Write", "description": "w"}},
+                {"type": "function", "function": {"name": "Glob", "description": "g"}},
+                {"type": "function", "function": {"name": "Grep", "description": "p"}},
+                {"type": "function", "function": {"name": "SearchReplace", "description": "s"}},
+                {"type": "function", "function": {"name": "RunCommand", "description": "t"}},
+                {"type": "function", "function": {"name": "DeleteFile", "description": "d"}},
+                {"type": "function", "function": {"name": "LS", "description": "l"}},
+            ]
+        }
+        tools = adapter._parse_split_client_tools(body)
+        names = [t["function"]["name"] for t in tools]
+        # Glob and Grep both canonicalize to search_files -> first wins;
+        # DeleteFile/LS have no Hermes counterpart -> ignored.
+        assert names == ["Read", "Write", "Glob", "SearchReplace", "RunCommand"]
+        # The canonical mapping drives the host-tool removal in _create_agent:
+        # SearchReplace/RunCommand must canonicalize onto patch/terminal so
+        # the server-side implementations are dropped from the toolset.
+        from gateway.platforms.api_server import _normalize_client_tool_name
+
+        assert _normalize_client_tool_name("SearchReplace") == "patch"
+        assert _normalize_client_tool_name("RunCommand") == "terminal"
 
     def test_parse_split_client_tools_empty(self):
         adapter = _make_adapter()

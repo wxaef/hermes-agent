@@ -193,8 +193,10 @@ CLIENT_TOOL_ALIASES: Dict[str, str] = {
     "patch": "patch",
     "edit": "patch",
     "edit_file": "patch",
+    "searchreplace": "patch",
     "terminal": "terminal",
     "bash": "terminal",
+    "runcommand": "terminal",
     "execute_code": "execute_code",
     "execute": "execute_code",
 }
