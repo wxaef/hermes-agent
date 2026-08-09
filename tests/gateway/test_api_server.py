@@ -2995,7 +2995,10 @@ class TestSplitRuntimeChatCompletions:
                 assert body2["choices"][0]["finish_reason"] == "stop"
                 assert seen["tool_result"] == '{"matches": ["a.py"]}'
 
-                # A late tool result after the turn ended -> 409 no_active_turn.
+                # A late ORPHAN tool result (no assistant tool_calls in the
+                # request) after the turn ended degrades into a fresh turn
+                # carrying it as a context block (orphan-resume default)
+                # instead of 409 no_active_turn.
                 late = await cli.post(
                     "/v1/chat/completions",
                     headers=headers,
@@ -3007,8 +3010,13 @@ class TestSplitRuntimeChatCompletions:
                         ],
                     },
                 )
-                assert late.status == 409
-                assert (await late.json())["error"]["code"] == "no_active_turn"
+                assert late.status == 200, await late.text()
+                body_late = await late.json()
+                assert body_late["choices"][0]["finish_reason"] == "tool_calls"
+                # Resolve the degraded turn's parked relay so nothing leaks.
+                assert ctg.resolve_client_tool(f"chat:{session_id}", "call_0001", '"{}"')
+                late_state = adapter._chat_split_runs[f"chat:{session_id}"]
+                await asyncio.wait_for(late_state.agent_task, timeout=5)
         assert ctg.has_pending(f"chat:{session_id}") is False
 
     @pytest.mark.asyncio
@@ -3819,6 +3827,84 @@ class TestSplitRuntimeChatCompletions:
                 assert seen["tool_result"] == '"edited ok"'
         assert ctg.has_pending(f"chat:{session_id}") is False
 
+    @pytest.mark.asyncio
+    async def test_trae_skill_shadows_skill_view_and_relays(self, monkeypatch):
+        """TRAE declares Skill; it must shadow Hermes' server-side
+        skill_view (whose host execution would answer "Skill not found"
+        for client-only skills like lark-doc) and relay the call back to
+        the client so TRAE executes its own local skill."""
+        from gateway.platforms.api_server import CLIENT_SHADOWABLE_TOOLS
+        from agent.agent_runtime_helpers import relay_client_tool
+        from tools import client_tool_gateway as ctg
+
+        # Precondition: the Skill alias lands on the shadowable skill_view.
+        assert "skill_view" in CLIENT_SHADOWABLE_TOOLS
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        session_id = "split-session-trae-skill"
+        seen = {}
+        mock_agent = MagicMock()
+
+        def fake_run_conversation(user_message, conversation_history, task_id):
+            raw = relay_client_tool(
+                mock_agent,
+                "Skill",
+                {"skill": "lark-doc", "input": "summarize the doc"},
+                "call_0004",
+            )
+            seen["tool_result"] = raw
+            return {"final_response": "skill done", "session_id": session_id}
+
+        mock_agent.run_conversation.side_effect = fake_run_conversation
+        mock_agent._client_tool_session_key = f"chat:{session_id}"
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+        headers = self._split_headers(session_id)
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            async with TestClient(TestServer(app)) as cli:
+                resp1 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "Skill",
+                                "description": "Run a local skill",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"skill": {"type": "string"}},
+                                },
+                            },
+                        }],
+                        "messages": [{"role": "user", "content": "use lark-doc"}],
+                    },
+                )
+                assert resp1.status == 200, await resp1.text()
+                assert (await resp1.json())["choices"][0]["finish_reason"] == "tool_calls"
+
+                resp2 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "messages": [
+                            {"role": "user", "content": "use lark-doc"},
+                            {"role": "tool", "tool_call_id": "call_0004", "content": '"lark summary"'},
+                        ],
+                    },
+                )
+                assert resp2.status == 200, await resp2.text()
+                body2 = await resp2.json()
+                assert body2["choices"][0]["message"]["content"] == "skill done"
+                assert seen["tool_result"] == '"lark summary"'
+        assert ctg.has_pending(f"chat:{session_id}") is False
+
     def test_resolve_unknown_session_returns_false(self):
         """A tool result for a session with no pending entry (and no exact
         call_id anywhere) must still fail closed at the gateway layer --
@@ -3919,15 +4005,75 @@ class TestSplitRuntimeChatCompletions:
         assert ctg.has_pending(f"chat:{session_id}") is False
 
     @pytest.mark.asyncio
-    async def test_orphan_tool_result_still_no_active_turn(self, monkeypatch):
-        """A role=tool message whose tool_call_id matches no assistant
-        tool_calls in the history (forged/corrupted) must still fail closed
+    async def test_orphan_tool_results_degrade_to_context_turn(self, monkeypatch):
+        """A role=tool batch whose ids match no assistant tool_calls (TRAE
+        local skills flush results the model never requested) degrades into
+        a fresh turn by default: the results fold into a user-role context
+        block instead of a hard 409 no_active_turn."""
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        seen = {}
+        mock_agent = MagicMock()
+
+        def fake_run_conversation(user_message, conversation_history, task_id):
+            seen["user_message"] = user_message
+            seen["history"] = conversation_history
+            return {"final_response": "continued", "session_id": "split-session-orphan-degrade"}
+
+        mock_agent.run_conversation.side_effect = fake_run_conversation
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+        headers = self._split_headers("split-session-orphan-degrade")
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "messages": [
+                            {"role": "user", "content": "edit x.md"},
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": "call_a",
+                                    "type": "function",
+                                    "function": {"name": "Read", "arguments": "{}"},
+                                }],
+                            },
+                            {"role": "tool", "name": "Read", "tool_call_id": "call_bogus", "content": "x"},
+                        ],
+                    },
+                )
+                assert resp.status == 200, await resp.text()
+                body = await resp.json()
+                assert body["choices"][0]["message"]["content"] == "continued"
+                # Orphan tool messages are folded into one user-role context
+                # block; no role=tool survives in the rebuilt history.
+                assert seen["user_message"] == "edit x.md"
+                assert [m["role"] for m in seen["history"]] == ["assistant", "user"]
+                ctx = seen["history"][-1]["content"]
+                assert "do not correspond to any tool call" in ctx
+                assert "[Read | call_bogus]" in ctx
+                assert "x" in ctx
+
+    @pytest.mark.asyncio
+    async def test_orphan_tool_result_rejected_when_orphan_resume_disabled(self, monkeypatch):
+        """With ``split_runtime_orphan_resume: false`` an orphan role=tool
+        message (no matching assistant tool_calls) must still fail closed
         with 409 no_active_turn when no live turn exists."""
         from tools import client_tool_gateway as ctg
 
         adapter = self._make_split_adapter()
         app = _create_app(adapter)
         monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+        monkeypatch.setattr(adapter, "_split_orphan_resume_enabled", lambda: False)
 
         headers = self._split_headers("split-session-orphan")
         async with TestClient(TestServer(app)) as cli:
@@ -4046,16 +4192,115 @@ class TestSplitRuntimeChatCompletions:
         assert ctg.has_pending(f"chat:{session_id}") is False
 
     @pytest.mark.asyncio
-    async def test_turn_finished_orphan_tool_result_still_rejected(self, monkeypatch):
-        """After the turn ended, a role=tool message whose tool_call_id
-        matches no assistant tool_calls in the history must still fail
-        closed with 409 turn_finished."""
+    async def test_turn_finished_orphan_tool_results_degrade_to_context_turn(self, monkeypatch):
+        """TRAE local skills execute their OWN pipeline tools and batch-
+        deliver the results AFTER the model already answered -- those
+        results link to no assistant tool_calls in the request (orphans).
+        With orphan-resume enabled (default) the batch degrades into a
+        fresh turn carrying the results as a user-role context block
+        instead of 409 turn_finished."""
         from agent.agent_runtime_helpers import relay_client_tool
         from tools import client_tool_gateway as ctg
 
         adapter = self._make_split_adapter()
         app = _create_app(adapter)
         monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        session_id = "split-session-turn-finished-orphan"
+        seen = {}
+        mock_agent = MagicMock()
+        phase = {"n": 0}
+
+        def fake_run_conversation(user_message, conversation_history, task_id):
+            phase["n"] += 1
+            if phase["n"] == 1:
+                # Turn 1: suspends on the client tool; after the result is
+                # delivered the agent resumes (same call) and the turn ENDS
+                # with a text answer.
+                relay_client_tool(mock_agent, "Read", {}, "call_0001")
+                return {"final_response": "done", "session_id": session_id}
+            # Turn 2 (orphan-resume): carries the folded context block.
+            seen["user_message"] = user_message
+            seen["history"] = conversation_history
+            return {"final_response": "continued", "session_id": session_id}
+
+        mock_agent.run_conversation.side_effect = fake_run_conversation
+        mock_agent._client_tool_session_key = f"chat:{session_id}"
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+        headers = self._split_headers(session_id)
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            async with TestClient(TestServer(app)) as cli:
+                # Phase 1: fresh turn suspends on Read.
+                resp1 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "tools": [{"type": "function", "function": {"name": "Read", "description": "r"}}],
+                        "messages": [{"role": "user", "content": "edit x.md"}],
+                    },
+                )
+                assert resp1.status == 200, await resp1.text()
+                assert (await resp1.json())["choices"][0]["finish_reason"] == "tool_calls"
+
+                # Turn ends normally (result delivered, agent answers); the
+                # state entry lingers with a done agent_task (SSE / TTL-
+                # window semantics -- the turn_finished condition).
+                state_obj = adapter._chat_split_runs[f"chat:{session_id}"]
+                assert ctg.resolve_client_tool(f"chat:{session_id}", "call_0001", '"r1"')
+                await asyncio.wait_for(state_obj.agent_task, timeout=5)
+                assert state_obj.agent_task.done()
+
+                # Phase 2: the client pipeline flushes a batch of results
+                # the model never requested -- they degrade into a fresh
+                # turn with a user-role context block.
+                orphan_results = [
+                    {"role": "tool", "name": "Read", "tool_call_id": f"call_orphan_{i}", "content": f"out {i}"}
+                    for i in range(14)
+                ]
+                resp3 = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "test-model",
+                        "tools": [{"type": "function", "function": {"name": "Read", "description": "r"}}],
+                        "messages": [
+                            {"role": "user", "content": "edit x.md"},
+                            {"role": "assistant", "content": "", "tool_calls": [{
+                                "id": "call_0001", "type": "function",
+                                "function": {"name": "Read", "arguments": "{}"},
+                            }]},
+                            *orphan_results,
+                        ],
+                    },
+                )
+                assert resp3.status == 200, await resp3.text()
+                body3 = await resp3.json()
+                assert body3["choices"][0]["message"]["content"] == "continued"
+                assert seen["user_message"] == "edit x.md"
+                # The 14 orphan tool messages fold into ONE user-role block;
+                # no role=tool survives in the rebuilt history.
+                assert [m["role"] for m in seen["history"]] == ["assistant", "user"]
+                ctx = seen["history"][-1]["content"]
+                assert "do not correspond to any tool call" in ctx
+                assert "[Read | call_orphan_0]" in ctx and "out 0" in ctx
+                assert "[Read | call_orphan_13]" in ctx and "out 13" in ctx
+        assert ctg.has_pending(f"chat:{session_id}") is False
+
+    @pytest.mark.asyncio
+    async def test_turn_finished_orphan_tool_result_rejected_when_disabled(self, monkeypatch):
+        """With ``split_runtime_orphan_resume: false`` an orphan role=tool
+        result delivered after the turn ended must still fail closed with
+        409 turn_finished."""
+        from agent.agent_runtime_helpers import relay_client_tool
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+        monkeypatch.setattr(adapter, "_split_orphan_resume_enabled", lambda: False)
 
         session_id = "split-session-turn-finished-orphan"
         mock_agent = MagicMock()
@@ -4086,15 +4331,15 @@ class TestSplitRuntimeChatCompletions:
                 assert resp1.status == 200, await resp1.text()
                 assert (await resp1.json())["choices"][0]["finish_reason"] == "tool_calls"
 
-                # Turn ends normally (result delivered, agent answers); the
-                # state entry lingers with a done agent_task (SSE / TTL-
-                # window semantics -- the turn_finished condition).
+                # Turn ends normally; the state entry lingers with a done
+                # agent_task (the turn_finished condition).
                 state_obj = adapter._chat_split_runs[f"chat:{session_id}"]
                 assert ctg.resolve_client_tool(f"chat:{session_id}", "call_0001", '"r1"')
                 await asyncio.wait_for(state_obj.agent_task, timeout=5)
 
                 # A forged/duplicated result (call_bogus) that links to no
-                # assistant tool_calls still 409s with turn_finished.
+                # assistant tool_calls still 409s with turn_finished when
+                # the orphan-resume fallback is disabled.
                 resp3 = await cli.post(
                     "/v1/chat/completions",
                     headers=headers,
@@ -4134,8 +4379,8 @@ class TestSplitRuntimeChatCompletions:
 
     def test_parse_split_client_tools_trae_ide_names(self):
         """TRAE declares its IDE tools under Claude-Code-style camelCase
-        names (Read/Write/Glob/Grep/SearchReplace/RunCommand/...).  The
-        shadowable ones participate in the relay with their client-side
+        names (Read/Write/Glob/Grep/SearchReplace/RunCommand/Skill/...).
+        The shadowable ones participate in the relay with their client-side
         names intact; IDE tools with no Hermes counterpart (DeleteFile,
         LS) are ignored so the server keeps its own implementations."""
         adapter = _make_adapter()
@@ -4147,6 +4392,7 @@ class TestSplitRuntimeChatCompletions:
                 {"type": "function", "function": {"name": "Grep", "description": "p"}},
                 {"type": "function", "function": {"name": "SearchReplace", "description": "s"}},
                 {"type": "function", "function": {"name": "RunCommand", "description": "t"}},
+                {"type": "function", "function": {"name": "Skill", "description": "k"}},
                 {"type": "function", "function": {"name": "DeleteFile", "description": "d"}},
                 {"type": "function", "function": {"name": "LS", "description": "l"}},
             ]
@@ -4155,14 +4401,16 @@ class TestSplitRuntimeChatCompletions:
         names = [t["function"]["name"] for t in tools]
         # Glob and Grep both canonicalize to search_files -> first wins;
         # DeleteFile/LS have no Hermes counterpart -> ignored.
-        assert names == ["Read", "Write", "Glob", "SearchReplace", "RunCommand"]
+        assert names == ["Read", "Write", "Glob", "SearchReplace", "RunCommand", "Skill"]
         # The canonical mapping drives the host-tool removal in _create_agent:
-        # SearchReplace/RunCommand must canonicalize onto patch/terminal so
-        # the server-side implementations are dropped from the toolset.
+        # SearchReplace/RunCommand/Skill must canonicalize onto
+        # patch/terminal/skill_view so the server-side implementations are
+        # dropped from the toolset.
         from gateway.platforms.api_server import _normalize_client_tool_name
 
         assert _normalize_client_tool_name("SearchReplace") == "patch"
         assert _normalize_client_tool_name("RunCommand") == "terminal"
+        assert _normalize_client_tool_name("Skill") == "skill_view"
 
     def test_parse_split_client_tools_empty(self):
         adapter = _make_adapter()

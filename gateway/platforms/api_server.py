@@ -174,6 +174,11 @@ CLIENT_SHADOWABLE_TOOLS = frozenset({
     "patch",
     "terminal",
     "execute_code",
+    # IDE agents (TRAE) ship their OWN skill library (e.g. lark-doc) that
+    # the server does not have; a model calling server-side skill_view for
+    # such a skill would get "Skill not found".  Shadowing lets the call
+    # relay to the client's local Skill tool instead.
+    "skill_view",
 })
 
 # Client tool-name aliases: IDE agents (TRAE Agent/Builder, Claude Code
@@ -199,6 +204,7 @@ CLIENT_TOOL_ALIASES: Dict[str, str] = {
     "runcommand": "terminal",
     "execute_code": "execute_code",
     "execute": "execute_code",
+    "skill": "skill_view",
 }
 
 
@@ -837,6 +843,93 @@ def _try_stale_resume(tool_results: list, messages: list) -> Optional[Tuple[str,
     if not _content_has_visible_payload(stale_user):
         return None
     return stale_user, stale_history
+
+
+# Per-result content cap when folding orphan tool results into a context
+# block -- a client pipeline can batch-deliver arbitrarily large outputs
+# (TRAE local skills frequently flush a dozen results at once).
+_ORPHAN_RESULT_CHAR_LIMIT = 4000
+
+
+def _try_orphan_resume(tool_results: list, messages: list) -> Optional[Tuple[str, list]]:
+    """Fallback degrade: fold tool results that link to NO assistant call
+    in the request into a user-role context block and run as a fresh turn.
+
+    Some IDE agents (TRAE local skills) execute their own pipeline tools
+    locally and batch-deliver the results AFTER the model already answered;
+    those results have no matching ``assistant.tool_calls`` in the request,
+    so ``_try_stale_resume`` rejects them.  This path rebuilds the history
+    WITHOUT the orphan ``role=tool`` messages (keeping them would break
+    message-role alternation) and appends a single user-role context block
+    that carries their contents, so the model sees the results and the
+    client pipeline is not stranded by a hard 409.  Returns ``None`` when
+    no visible user payload can be recovered.  Callers gate this on
+    ``split_runtime_orphan_resume`` so strict fail-closed stays available.
+    """
+    normalized = []
+    for m in messages:
+        role = m.get("role", "")
+        if role == "system":
+            continue
+        if role in {"user", "assistant"}:
+            try:
+                content = _normalize_multimodal_content(m.get("content", ""))
+            except ValueError:
+                content = _normalize_chat_content(m.get("content", ""))
+            extra = {k: v for k, v in m.items() if k not in ("role", "content")}
+            normalized.append({"role": role, "content": content, **extra})
+        # role=tool messages are dropped; their contents are folded into the
+        # context block below.
+    last_user_idx = -1
+    for i, cm in enumerate(normalized):
+        if cm.get("role") == "user" and _content_has_visible_payload(cm.get("content", "")):
+            last_user_idx = i
+    if last_user_idx < 0:
+        return None
+    user_message = normalized[last_user_idx].get("content", "")
+    history = normalized[:last_user_idx] + normalized[last_user_idx + 1:]
+    blocks = []
+    for tm in tool_results:
+        name = (tm.get("name") or "client tool").strip()
+        call_id = tm.get("tool_call_id") or "?"
+        content = tm.get("content")
+        if isinstance(content, (dict, list)):
+            content = json.dumps(content, ensure_ascii=False)
+        content = "" if content is None else str(content)
+        if len(content) > _ORPHAN_RESULT_CHAR_LIMIT:
+            content = content[:_ORPHAN_RESULT_CHAR_LIMIT] + \
+                f"\n…[truncated {len(content)} chars]"
+        blocks.append(f"[{name} | {call_id}]\n{content}")
+    history.append({
+        "role": "user",
+        "content": (
+            "Client tool results were delivered after the previous turn "
+            "ended; they do not correspond to any tool call made this turn. "
+            "Treat them as context and continue:\n\n" + "\n\n".join(blocks)
+        ),
+    })
+    return user_message, history
+
+
+def _log_split_stale_reject(reason: str, tool_results: list, messages: list) -> None:
+    """Diagnostic for a rejected stale/orphan tool-result delivery.
+
+    Logs the delivered ``tool_call_id`` set against the assistant calls
+    present in the same request so the rejection is auditable (e.g. a TRAE
+    pipeline flushes results that never came from the model).
+    """
+    known = {
+        tc.get("id")
+        for m in messages if m.get("role") == "assistant"
+        for tc in (m.get("tool_calls") or [])
+        if isinstance(tc, dict) and tc.get("id")
+    }
+    delivered = {tm.get("tool_call_id", "") for tm in tool_results}
+    logger.warning(
+        "[api_server] split-runtime stale-resume rejected (%s): "
+        "tool_call_ids=%s matching_known=%d known_call_ids=%s",
+        reason, sorted(delivered), len(delivered & known), sorted(known),
+    )
 
 
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
@@ -3202,6 +3295,38 @@ class APIServerAdapter(BasePlatformAdapter):
                 cache[profile_key] = False
         return cache[profile_key]
 
+    def _split_orphan_resume_enabled(self) -> bool:
+        """Whether orphan tool results (no matching ``assistant.tool_calls``
+        in the request) may degrade into a fresh turn when the previous one
+        ended.
+
+        On by default: TRAE-style IDE pipelines execute their own local
+        tools and batch-deliver results after the model answered; without
+        this the client pipeline is stranded by a hard 409
+        (turn_finished/no_active_turn).  Set ``api_server:
+        split_runtime_orphan_resume: false`` in the profile config to
+        restore strict fail-closed behavior.  Resolution mirrors
+        ``_split_runtime_enabled`` (profile-cached, never cached
+        process-wide).
+        """
+        profile_key = _api_request_profile.get() or ""
+        cache = getattr(self, "_orphan_resume_config_cache", None)
+        if cache is None:
+            cache = {}
+            self._orphan_resume_config_cache = cache
+        if profile_key not in cache:
+            try:
+                from hermes_cli.config import load_config
+
+                cfg = load_config() or {}
+                api_cfg = cfg.get("api_server", {}) or {}
+                cache[profile_key] = _coerce_request_bool(
+                    api_cfg.get("split_runtime_orphan_resume", True)
+                )
+            except Exception:
+                cache[profile_key] = True
+        return cache[profile_key]
+
     # ------------------------------------------------------------------
     # HTTP Handlers
     # ------------------------------------------------------------------
@@ -4510,7 +4635,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 # of the client seeing a hard 409.  Orphan tool messages
                 # (no matching assistant call) still fail closed.
                 _stale = _try_stale_resume(tool_results, messages)
+                if _stale is None and self._split_orphan_resume_enabled():
+                    # Batch results from a client pipeline that executed its
+                    # own tools (TRAE local skills): no assistant call to
+                    # link to, so fold them into a user-role context block
+                    # instead of stranding the pipeline.
+                    _stale = _try_orphan_resume(tool_results, messages)
                 if _stale is None:
+                    _log_split_stale_reject("no_active_turn", tool_results, messages)
                     return web.json_response(
                         _openai_error(
                             "No active agent turn for this session; cannot deliver a tool result "
@@ -4533,7 +4665,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._chat_split_runs.pop(relay_key, None)
                 if tool_results:
                     _stale = _try_stale_resume(tool_results, messages)
+                    if _stale is None and self._split_orphan_resume_enabled():
+                        _stale = _try_orphan_resume(tool_results, messages)
                     if _stale is None:
+                        _log_split_stale_reject("turn_finished", tool_results, messages)
                         return web.json_response(
                             _openai_error(
                                 "This session's agent turn already ended; cannot deliver the tool result.",
