@@ -176,6 +176,43 @@ CLIENT_SHADOWABLE_TOOLS = frozenset({
     "execute_code",
 })
 
+# Client tool-name aliases: IDE agents (TRAE Agent/Builder, Claude Code
+# style) declare their local tools under Claude-Code-style camelCase names
+# (Read/Glob/Grep/Edit/Write/Bash) even when they speak the OpenAI
+# protocol.  Every alias maps to the Hermes tool whose semantics it
+# shadows, so the split decision and the host-tool removal both key off
+# one canonical name.
+CLIENT_TOOL_ALIASES: Dict[str, str] = {
+    "search_files": "search_files",
+    "glob": "search_files",
+    "grep": "search_files",
+    "read_file": "read_file",
+    "read": "read_file",
+    "write_file": "write_file",
+    "write": "write_file",
+    "patch": "patch",
+    "edit": "patch",
+    "edit_file": "patch",
+    "terminal": "terminal",
+    "bash": "terminal",
+    "execute_code": "execute_code",
+    "execute": "execute_code",
+}
+
+
+def _normalize_client_tool_name(name: str) -> str:
+    """Map a client-declared tool name to its canonical Hermes tool name.
+
+    Lowercases and resolves Claude-Code-style aliases (``Read`` ->
+    ``read_file``, ``Glob``/``Grep`` -> ``search_files``, ``Bash`` ->
+    ``terminal``, ...).  Unknown names pass through lowercased so callers
+    can still compare them against the host toolset.
+    """
+    if not name:
+        return ""
+    lowered = name.lower()
+    return CLIENT_TOOL_ALIASES.get(lowered, lowered)
+
 
 @dataclass
 class ChatSplitState:
@@ -3002,13 +3039,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not _name:
                     continue
                 client_defs.append(_fn)
-                # A client tool shadowing a same-named host tool wins: drop the
-                # host entry so the relay path handles it.  (Names colliding
-                # with agent-level dispatch tools are filtered upstream in
+                # A client tool shadowing a host tool wins: drop every host
+                # entry whose canonical name matches, so the relay path
+                # handles it.  Canonical matching matters for camelCase
+                # aliases -- TRAE declaring ``Glob`` must remove Hermes'
+                # ``search_files`` or the model can still pick the server
+                # implementation.  (Names colliding with agent-level
+                # dispatch tools are filtered upstream in
                 # _parse_split_client_tools before we get here.)
+                _shadowed = _normalize_client_tool_name(_name)
                 agent.tools = [
                     t for t in agent.tools
-                    if (t.get("function", {}) or {}).get("name") != _name
+                    if _normalize_client_tool_name(
+                        (t.get("function", {}) or {}).get("name") or ""
+                    ) != _shadowed
                 ]
                 agent.tools.append({"type": "function", "function": _fn})
                 agent.valid_tool_names.add(_name)
@@ -4345,6 +4389,14 @@ class APIServerAdapter(BasePlatformAdapter):
             state = self._chat_split_runs.get(relay_key)
             client_tools = self._parse_split_client_tools(body)
             tool_results = [m for m in messages if m.get("role") == "tool"]
+            logger.info(
+                "[api_server] split-runtime decision session=%s state=%s "
+                "client_tools=%d tool_results=%d",
+                session_id,
+                "resume" if state is not None else "none",
+                len(client_tools),
+                len(tool_results),
+            )
 
             if tool_results and state is None:
                 return web.json_response(
@@ -4825,30 +4877,67 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
     def _parse_split_client_tools(self, body: dict) -> List[Dict[str, Any]]:
-        """Extract shadowable client tools from an OpenAI ``tools`` array.
+        """Extract shadowable client tools from a ``tools`` array.
 
-        Only names in ``CLIENT_SHADOWABLE_TOOLS`` participate in the relay.
-        Any other name the client declares (web_search, memory, mcp_*, ...)
-        is intentionally ignored -- Hermes keeps executing its own
-        server-side implementation for those, per the tool-precedence rule:
-        a client-declared shadowable tool wins; everything else stays on the
-        server.  Malformed entries and duplicates are skipped.
+        Accepts both the OpenAI shape (``{"type": "function", "function":
+        {...}}``) and the Anthropic/Claude-Code shape used by IDE agents
+        like TRAE Agent mode (bare ``{"name": ..., "input_schema": {...}}``
+        with no ``function`` wrapper).  Names are matched through
+        ``_normalize_client_tool_name`` so camelCase aliases (``Read``,
+        ``Glob``, ``Bash``, ...) shadow the same Hermes tool their
+        lower-case form would.  Only names whose canonical form lands in
+        ``CLIENT_SHADOWABLE_TOOLS`` participate in the relay; any other name
+        the client declares (web_search, memory, mcp_*, ...) is
+        intentionally ignored -- Hermes keeps executing its own server-side
+        implementation for those, per the tool-precedence rule: a
+        client-declared shadowable tool wins; everything else stays on the
+        server.  Malformed entries and duplicates (by canonical name) are
+        skipped.
         """
+        declared: List[str] = []
+        shadowed: List[str] = []
         seen: set = set()
         result: List[Dict[str, Any]] = []
         for t in body.get("tools") or []:
             if not isinstance(t, dict):
                 continue
             fn = t.get("function")
-            if not isinstance(fn, dict):
+            if isinstance(fn, dict):
+                name = fn.get("name")
+            else:
+                # Anthropic/Claude-Code shape: bare {name, description,
+                # input_schema} with no "function" wrapper.  Wrap it into
+                # the OpenAI function shape so downstream injection and
+                # relay code only ever handles one format.
+                raw_name = t.get("name")
+                if not isinstance(raw_name, str) or not raw_name:
+                    continue
+                parameters = t.get("input_schema")
+                if not isinstance(parameters, dict):
+                    continue
+                fn = {
+                    "name": raw_name,
+                    "description": t.get("description") or "",
+                    "parameters": parameters,
+                }
+                name = raw_name
+            if not isinstance(name, str) or not name:
                 continue
-            name = fn.get("name")
-            if not isinstance(name, str) or name not in CLIENT_SHADOWABLE_TOOLS:
+            declared.append(name)
+            canonical = _normalize_client_tool_name(name)
+            if canonical not in CLIENT_SHADOWABLE_TOOLS:
                 continue
-            if name in seen:
+            if canonical in seen:
                 continue
-            seen.add(name)
+            seen.add(canonical)
+            shadowed.append(name)
             result.append({"type": "function", "function": fn})
+        if declared:
+            logger.info(
+                "[api_server] split-runtime tools declared by client: %s; shadowed: %s",
+                ", ".join(declared),
+                ", ".join(shadowed) or "(none)",
+            )
         return result
 
     def _build_tool_calls_response(

@@ -3115,6 +3115,324 @@ class TestSplitRuntimeChatCompletions:
         assert ctg.has_pending(f"chat:{session_id}") is False
 
     @pytest.mark.asyncio
+    async def test_split_chat_injects_client_tools_through_real_create_agent(self, monkeypatch):
+        """Full-path relay with the REAL _create_agent injection code.
+
+        Unlike the sibling roundtrip tests (which stub _create_agent), this
+        one patches only ``run_agent.AIAgent`` -- so the tool-merge block
+        inside _create_agent really runs: host search_files is replaced by
+        the client definition, the relay metadata lands on the agent, and
+        the system prompt is invalidated.  Proves the "tools handed to the
+        client" contract without a live model.
+        """
+        from agent.agent_runtime_helpers import relay_client_tool
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        captured = {}
+        seen = {}
+
+        class FakeAgent:
+            """Minimal stand-in for a constructed AIAgent -- carries the host
+            tool surface get_tool_definitions would have produced."""
+
+            def __init__(self, **kwargs):
+                self.tools = [
+                    {"type": "function", "function": {"name": "search_files", "description": "host search_files", "parameters": {"type": "object", "properties": {}}}},
+                    {"type": "function", "function": {"name": "read_file", "description": "host read_file", "parameters": {"type": "object", "properties": {}}}},
+                    {"type": "function", "function": {"name": "web_search", "description": "host web_search", "parameters": {"type": "object", "properties": {}}}},
+                ]
+                self.valid_tool_names = {"search_files", "read_file", "web_search"}
+                self.session_id = kwargs.get("session_id")
+                self._cached_system_prompt = "cached-prompt"
+                self._client_tool_names = set()
+                self._client_tool_defs = []
+                self._client_tool_session_key = ""
+                self.session_prompt_tokens = 1
+                self.session_completion_tokens = 2
+                self.session_total_tokens = 3
+                self.run_conversation_calls = 0
+
+            def _invalidate_system_prompt(self):
+                self._cached_system_prompt = None
+
+            def run_conversation(self, user_message, conversation_history, task_id):
+                # The model asked for a client tool: the real relay path
+                # suspends until the role=tool request resolves it.
+                self.run_conversation_calls += 1
+                captured["agent"] = self
+                seen["tool_result"] = relay_client_tool(
+                    self, "search_files", {"query": "hermes"}, "call_7001"
+                )
+                return {"final_response": "relayed ok", "messages": []}
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {"provider": "openai-codex", "base_url": "https://example.test/v1", "api_mode": "codex_responses"},
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.5")
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {"agent": {"reasoning_effort": "xhigh"}, "checkpoints": {"enabled": True}},
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda model="": {"enabled": True, "effort": "xhigh"}),
+        )
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+        session_id = "split-inject-session-1"
+        headers = self._split_headers(session_id)
+        client_def = {
+            "type": "function",
+            "function": {"name": "search_files", "description": "TRAE search_files", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}},
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            # Phase 1: agent suspends on search_files -> tool_calls.
+            resp1 = await cli.post(
+                "/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": "test-model",
+                    "tools": [client_def],
+                    "messages": [{"role": "user", "content": "search for hermes"}],
+                },
+            )
+            assert resp1.status == 200, await resp1.text()
+            choice1 = (await resp1.json())["choices"][0]
+            assert choice1["finish_reason"] == "tool_calls"
+            assert choice1["message"]["tool_calls"][0]["id"] == "call_7001"
+            assert choice1["message"]["tool_calls"][0]["function"]["name"] == "search_files"
+
+            # Phase 2: deliver the tool result -> the same agent resumes.
+            resp2 = await cli.post(
+                "/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": "test-model",
+                    "messages": [
+                        {"role": "user", "content": "search for hermes"},
+                        {"role": "assistant", "content": "", "tool_calls": [{
+                            "id": "call_7001", "type": "function",
+                            "function": {"name": "search_files", "arguments": '{"query": "hermes"}'},
+                        }]},
+                        {"role": "tool", "tool_call_id": "call_7001", "content": '{"matches": ["a.py"]}'},
+                    ],
+                },
+            )
+            assert resp2.status == 200, await resp2.text()
+            body2 = await resp2.json()
+            assert body2["choices"][0]["message"]["content"] == "relayed ok"
+            assert body2["choices"][0]["finish_reason"] == "stop"
+            assert seen["tool_result"] == '{"matches": ["a.py"]}'
+
+        # Injection evidence on the REAL _create_agent path:
+        agent = captured["agent"]
+        injected = {t["function"]["name"]: t["function"] for t in agent.tools}
+        # Client definition replaced the same-named host tool...
+        assert injected["search_files"]["description"] == "TRAE search_files"
+        # ...the host definition is gone (not merely shadowed)...
+        assert all(t["function"]["description"] != "host search_files" for t in agent.tools)
+        # ...and non-shadowed tools stay untouched.
+        assert injected["web_search"]["description"] == "host web_search"
+        assert injected["read_file"]["description"] == "host read_file"
+        assert agent._client_tool_names == {"search_files"}
+        assert agent._client_tool_defs == [client_def["function"]]
+        assert agent._client_tool_session_key == f"chat:{session_id}"
+        # The cached <tools> system-prompt block was invalidated so the
+        # rebuilt prompt documents the client tool.
+        assert agent._cached_system_prompt is None
+        assert agent.run_conversation_calls == 1
+        assert ctg.has_pending(f"chat:{session_id}") is False
+
+    @pytest.mark.asyncio
+    async def test_split_chat_claude_code_style_tools_full_roundtrip(self, monkeypatch):
+        """TRAE Agent mode declares its local tools in Claude-Code style --
+        bare camelCase {name, description, input_schema} entries, NOT OpenAI
+        {type, function} wrappers.  They must trigger the split path, shadow
+        the same-named host tools (Glob removes search_files, Bash removes
+        terminal, Read removes read_file), and come back as tool_calls under
+        their ORIGINAL client names so TRAE executes them locally.
+        """
+        from agent.agent_runtime_helpers import relay_client_tool
+        from tools import client_tool_gateway as ctg
+
+        adapter = self._make_split_adapter()
+        app = _create_app(adapter)
+        monkeypatch.setattr(ctg, "get_client_tool_timeout", lambda: 3)
+
+        captured = {}
+
+        class FakeAgent:
+            """Host tool surface as get_tool_definitions would produce it."""
+
+            def __init__(self, **kwargs):
+                self.tools = [
+                    {"type": "function", "function": {"name": "search_files", "description": "host search_files", "parameters": {"type": "object", "properties": {}}}},
+                    {"type": "function", "function": {"name": "read_file", "description": "host read_file", "parameters": {"type": "object", "properties": {}}}},
+                    {"type": "function", "function": {"name": "terminal", "description": "host terminal", "parameters": {"type": "object", "properties": {}}}},
+                    {"type": "function", "function": {"name": "web_search", "description": "host web_search", "parameters": {"type": "object", "properties": {}}}},
+                ]
+                self.valid_tool_names = {"search_files", "read_file", "terminal", "web_search"}
+                self.session_id = kwargs.get("session_id")
+                self._cached_system_prompt = "cached-prompt"
+                self._client_tool_names = set()
+                self._client_tool_defs = []
+                self._client_tool_session_key = ""
+                self.session_prompt_tokens = 1
+                self.session_completion_tokens = 2
+                self.session_total_tokens = 3
+                self.run_conversation_calls = 0
+
+            def _invalidate_system_prompt(self):
+                self._cached_system_prompt = None
+
+            def run_conversation(self, user_message, conversation_history, task_id):
+                self.run_conversation_calls += 1
+                captured["agent"] = self
+                captured["tool_result"] = relay_client_tool(
+                    self, "Read", {"file_path": "/tmp/a.py"}, "call_8001"
+                )
+                return {"final_response": "read ok", "messages": []}
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {"provider": "openai-codex", "base_url": "https://example.test/v1", "api_mode": "codex_responses"},
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.5")
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {"agent": {"reasoning_effort": "xhigh"}, "checkpoints": {"enabled": True}},
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda model="": {"enabled": True, "effort": "xhigh"}),
+        )
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+        session_id = "split-claude-style-1"
+        headers = self._split_headers(session_id)
+        # Claude-Code-style declarations exactly as an IDE agent would send
+        # them: no "type"/"function" wrapper, camelCase names, input_schema.
+        trae_tools = [
+            {"name": "Read", "description": "read a file", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}},
+            {"name": "Glob", "description": "find files by pattern", "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}}},
+            {"name": "Bash", "description": "run a shell command", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}},
+            {"name": "WebSearch", "description": "search the web", "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}}},
+        ]
+
+        async with TestClient(TestServer(app)) as cli:
+            resp1 = await cli.post(
+                "/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": "test-model",
+                    "tools": trae_tools,
+                    "messages": [{"role": "user", "content": "read /tmp/a.py"}],
+                },
+            )
+            assert resp1.status == 200, await resp1.text()
+            choice1 = (await resp1.json())["choices"][0]
+            assert choice1["finish_reason"] == "tool_calls"
+            # The relay answers under the ORIGINAL client name "Read", which
+            # is what TRAE recognises and executes locally.
+            assert choice1["message"]["tool_calls"][0]["id"] == "call_8001"
+            assert choice1["message"]["tool_calls"][0]["function"]["name"] == "Read"
+
+            resp2 = await cli.post(
+                "/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": "test-model",
+                    "messages": [
+                        {"role": "user", "content": "read /tmp/a.py"},
+                        {"role": "assistant", "content": "", "tool_calls": [{
+                            "id": "call_8001", "type": "function",
+                            "function": {"name": "Read", "arguments": '{"file_path": "/tmp/a.py"}'},
+                        }]},
+                        {"role": "tool", "tool_call_id": "call_8001", "content": '"file contents"'},
+                    ],
+                },
+            )
+            assert resp2.status == 200, await resp2.text()
+            body2 = await resp2.json()
+            assert body2["choices"][0]["message"]["content"] == "read ok"
+            assert body2["choices"][0]["finish_reason"] == "stop"
+            assert captured["tool_result"] == '"file contents"'
+
+        agent = captured["agent"]
+        injected = {t["function"]["name"]: t["function"] for t in agent.tools}
+        # Client definitions landed under their original camelCase names...
+        assert set(injected) == {"Read", "Glob", "Bash", "web_search"}
+        assert injected["Read"]["parameters"] == trae_tools[0]["input_schema"]
+        # ...host tools shadowed by aliases are GONE (not merely shadowed)...
+        assert "search_files" not in injected and "read_file" not in injected
+        assert "terminal" not in injected
+        # ...non-shadowable client tools (WebSearch) are NOT injected, and
+        # the untouched host web_search survives as-is.
+        assert injected["web_search"]["description"] == "host web_search"
+        assert agent._client_tool_names == {"Read", "Glob", "Bash"}
+        assert agent._client_tool_session_key == f"chat:{session_id}"
+        assert agent._cached_system_prompt is None
+        assert agent.run_conversation_calls == 1
+        assert ctg.has_pending(f"chat:{session_id}") is False
+
+    @pytest.mark.asyncio
+    async def test_parse_split_client_tools_anthropic_shape_and_aliases(self, monkeypatch):
+        """Unit-level: the parser accepts both tool shapes and resolves
+        camelCase aliases to the canonical shadowable name.  Declaring
+        ``Glob`` must shadow search_files, ``Read``/``read_file`` must
+        dedupe to one entry, and non-shadowable names must be ignored.
+        """
+        from gateway.platforms import api_server as api_mod
+
+        adapter = self._make_split_adapter()
+
+        # OpenAI shape + Claude-Code shape mixed, plus a duplicate canonical
+        # (read_file vs Read) and a non-shadowable (WebSearch).
+        body = {
+            "tools": [
+                {"type": "function", "function": {"name": "read_file", "description": "openai read", "parameters": {"type": "object"}}},
+                {"name": "Read", "description": "cc read", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "Glob", "description": "cc glob", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "Grep", "description": "cc grep", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "Bash", "description": "cc bash", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "WebSearch", "description": "cc web", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "mcp__filesystem", "description": "mcp", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "", "input_schema": {"type": "object"}},
+                {"name": "Write", "description": "cc write", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "Edit", "description": "cc edit", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "Execute", "description": "cc execute", "input_schema": {"type": "object", "properties": {}}},
+            ]
+        }
+        parsed = adapter._parse_split_client_tools(body)
+        names = [t["function"]["name"] for t in parsed]
+        # First canonical wins: read_file before Read -> openai read kept.
+        assert names == ["read_file", "Glob", "Bash", "Write", "Edit", "Execute"]
+        assert parsed[1]["function"]["parameters"] == {"type": "object", "properties": {}}
+        # Anthropic entry was wrapped into the OpenAI function shape.
+        assert parsed[1]["function"]["description"] == "cc glob"
+        # Everything else ignored: WebSearch, mcp__filesystem, empty name.
+
+        # Canonical name resolution unit-level.
+        assert api_mod._normalize_client_tool_name("Read") == "read_file"
+        assert api_mod._normalize_client_tool_name("glob") == "search_files"
+        assert api_mod._normalize_client_tool_name("Grep") == "search_files"
+        assert api_mod._normalize_client_tool_name("Bash") == "terminal"
+        assert api_mod._normalize_client_tool_name("Edit") == "patch"
+        assert api_mod._normalize_client_tool_name("Write") == "write_file"
+        assert api_mod._normalize_client_tool_name("Execute") == "execute_code"
+        assert api_mod._normalize_client_tool_name("weird_name") == "weird_name"
+
+    @pytest.mark.asyncio
     async def test_client_tool_relay_roundtrip_streaming(self, monkeypatch):
         """Same round trip with stream=true: phase 1 ends with a tool_calls
         chunk + [DONE] (agent stays parked), phase 2 delivers the result
