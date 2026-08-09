@@ -3659,7 +3659,11 @@ class TestSplitRuntimeChatCompletions:
         assert ctg.has_pending(f"chat:{session_id}") is False
 
     @pytest.mark.asyncio
-    async def test_tool_result_for_wrong_call_id_returns_409(self, monkeypatch):
+    async def test_client_renamed_call_id_resolves_unique_pending(self, monkeypatch):
+        """TRAE-style shells replace the upstream tool_call_id with their
+        own before echoing the round trip.  With exactly one pending client
+        tool per session (the agent thread executes tools serially), the
+        renamed id must resolve the parked call instead of 409ing."""
         from agent.agent_runtime_helpers import relay_client_tool
         from tools import client_tool_gateway as ctg
 
@@ -3680,6 +3684,9 @@ class TestSplitRuntimeChatCompletions:
 
         mock_agent.run_conversation.side_effect = fake_run_conversation
         mock_agent._client_tool_session_key = f"chat:{session_id}"
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
         headers = self._split_headers(session_id)
         with patch.object(adapter, "_create_agent", return_value=mock_agent):
             async with TestClient(TestServer(app)) as cli:
@@ -3698,23 +3705,34 @@ class TestSplitRuntimeChatCompletions:
                 assert resp1.status == 200, await resp1.text()
                 assert (await resp1.json())["choices"][0]["finish_reason"] == "tool_calls"
 
-                # Wrong call_id (not the pending one) -> 409 tool_call_not_pending.
-                wrong = await cli.post(
+                # Client-renamed call_id (call_9999 instead of the pending
+                # call_0002) must resolve the session-unique parked call.
+                resp2 = await cli.post(
                     "/v1/chat/completions",
                     headers=headers,
                     json={
                         "model": "test-model",
                         "messages": [
                             {"role": "user", "content": "read a.py"},
-                            {"role": "tool", "tool_call_id": "call_9999", "content": "{}"},
+                            {"role": "tool", "tool_call_id": "call_9999", "content": '"file contents"'},
                         ],
                     },
                 )
-                assert wrong.status == 409
-                assert (await wrong.json())["error"]["code"] == "tool_call_not_pending"
-                # The agent thread is still parked; clean it up so the test exits.
-                ctg.clear_session(f"chat:{session_id}")
+                assert resp2.status == 200, await resp2.text()
+                body2 = await resp2.json()
+                assert body2["choices"][0]["message"]["content"] == "done"
+                assert body2["choices"][0]["finish_reason"] == "stop"
+                assert seen["tool_result"] == '"file contents"'
         assert ctg.has_pending(f"chat:{session_id}") is False
+
+    def test_resolve_unknown_session_returns_false(self):
+        """A tool result for a session with no pending entry (and no exact
+        call_id anywhere) must still fail closed at the gateway layer --
+        the api_server turns that into 409 tool_call_not_pending."""
+        from tools import client_tool_gateway as ctg
+
+        assert ctg.resolve_client_tool("chat:never-registered", "call_x", "{}") is False
+        assert ctg.has_pending("chat:never-registered") is False
 
     def test_parse_split_client_tools_filters(self):
         """Only shadowable names participate; duplicates and non-shadowable

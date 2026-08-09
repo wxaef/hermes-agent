@@ -164,12 +164,24 @@ def resolve_client_tool(session_key: str, call_id: str, result_json: str) -> boo
     even when the caller knows a valid call_id.  ``result_json`` is the
     tool-result string handed back to the model.
 
+    When the exact ``call_id`` is not found, a session-unique pending entry
+    is accepted as a fallback: client shells like TRAE treat Hermes as a
+    pure LLM provider and replace the upstream ``tool_call_id`` with their
+    own generated id before echoing the round trip.  The agent thread
+    executes tool calls serially -- at most one client tool can be pending
+    per session at any moment -- so a single pending entry is unambiguous;
+    with several pending entries the exact id is still required.
+
     Returns True if a pending entry was found and resolved, False otherwise
     (wrong session, already resolved, expired, or never existed -> caller
     returns 409).
     """
     with _lock:
         entry = _entries.get((session_key, call_id))
+        if entry is None:
+            ids = _session_index.get(session_key) or []
+            if len(ids) == 1:
+                entry = _entries.get((session_key, ids[0]))
         if entry is None:
             return False
     entry.result = str(result_json) if result_json is not None else ""
